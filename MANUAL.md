@@ -89,6 +89,12 @@ cd /work/eridu_drone/kjr/odm-kjr
     /work/eridu_drone/kjr/products/KJ1
 ```
 
+권장 실행 (ODM DSM을 참조로):
+
+```bash
+REF_DSM=/work/eridu_drone/odm_data/KJ1_gcp/odm_dem/dsm.tif ./run_block.sh KJ1 ...
+```
+
 오래 걸리므로 `nohup ... &`로 띄우고 `<작업 폴더>/run_block.log`를 본다.
 
 **ODM 폴더와 원본 사진은 읽기만 한다.** 모든 결과는 작업 폴더와 제품 폴더에만 쓴다.
@@ -98,7 +104,7 @@ cd /work/eridu_drone/kjr/odm-kjr
 | 변수 | 기본값 | 의미 |
 |---|---|---|
 | `STAGES` | 전체 | 실행할 단계만 지정. 예: `STAGES="blend ortho products"` |
-| `REF_DSM` | (없음) | 긴 파장 참조 DSM을 직접 지정한다. 그러면 `ref` 단계는 사진 쌍 목록만 만들고 약 45분을 아낀다. |
+| `REF_DSM` | (없음) | 긴 파장 참조 DSM을 직접 지정한다. **권장값: ODM 자체 DSM (`<ODM 처리 폴더>/odm_dem/dsm.tif`).** 그러면 `ref` 단계는 사진 쌍 목록만 만들고 약 45분을 아낀다. JJ-1에서 GCP 높이 RMS는 ODM 카메라로 만든 참조를 쓸 때 13.6 cm, ODM DSM을 쓸 때 8.3 cm였고, 무늬 제거 효과는 같았다 (0.46/0.18 → 0.47/0.19). |
 | `SIGMA` | 30 | `blend`의 Gaussian σ (m) |
 | `BBA_ITERS` | 30 | 번들 조정 반복 횟수 |
 | `TIE_WORKERS` | 3 | tie point 병렬 작업 수. GPU 메모리가 모자라면 자동으로 재시도한다. |

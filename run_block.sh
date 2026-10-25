@@ -15,6 +15,7 @@
 # Usage: run_block.sh <BLOCK> <odm run> <image dir> <gcp list> <work dir> <products dir>
 # Env:   STAGES="ties bba ..." run only these (default: all, in order)
 #        REF_DSM=<tif>  use this as the long-wave reference instead of making ref/dsm_fused.tif
+#                       (recommended: <odm run>/odm_dem/dsm.tif; JJ-1 GCP RMS 8.3 vs 13.6 cm, 45 min less)
 #        SIGMA=30 (blend, m)  BBA_ITERS=30  TIE_WORKERS=3
 # Every stage skips when its output already exists: rerun after a failure resumes;
 # delete a stage's output to redo it.
