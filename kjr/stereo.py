@@ -4,7 +4,8 @@
 For every overlapping image pair of the ODM run (cameras unchanged):
   1. rectify both undistorted images to a common rotation (x = baseline);
      only the ground overlap of the pair is resampled;
-  2. warp the right image by the disparity of the SfM ground plane (prior);
+  2. warp the right image by the disparity of a prior surface: a DSM (--prior-dsm,
+     e.g. ODM's), else the SfM ground plane;
   3. census-SGM pyramid (UAV pfsgbm, soft census, MGM, CUDA) for the residual;
   4. triangulate, bin to the common ground grid (mean z per cell).
 Writes <out>/pairs/<n1>__<n2>.npz = {r0, c0, z (float32, NaN), n (uint8)}.
@@ -63,11 +64,46 @@ def cut_corners(img, cam):
     return img
 
 
+class PriorSurface:
+    """Height prior for the disparity search: a DSM (e.g. ODM's own), smoothed and
+    resampled to PRIOR_CELL, in the run's local frame. The matcher searches only
+    +-search_range px around the prior (~ +-1 m of height at B 130 m, +-0.5 m at
+    260 m), so a single ground plane cut off every surface more than ~1 m off it
+    (JJ-1 north: 5 % of the block, a bank and the hummocks below it -> noise)."""
+    PRIOR_CELL = 0.5     # m
+    SMOOTH = 1.0         # m, Gaussian
+
+    def __init__(self, tif, offset, plane):
+        from osgeo import gdal
+        from scipy import ndimage
+        d = gdal.Warp("", tif, format="MEM", xRes=self.PRIOR_CELL, yRes=self.PRIOR_CELL,
+                      resampleAlg="average", dstNodata=np.nan, outputType=gdal.GDT_Float32)
+        gt = d.GetGeoTransform()
+        z = d.ReadAsArray().astype(np.float32)
+        z[~np.isfinite(z) | (z < -1000)] = np.nan
+        H, W = z.shape
+        self.x0, self.y0, self.c = gt[0] - offset[0], gt[3] - offset[1], gt[1]
+        yy, xx = np.mgrid[0:H, 0:W]
+        zpl = plane[0] + plane[1] * (self.x0 + (xx + .5) * self.c) + plane[2] * (self.y0 - (yy + .5) * self.c)
+        m = np.isfinite(z)
+        sg = self.SMOOTH / self.c
+        num = ndimage.gaussian_filter(np.where(m, z - zpl, 0), sg)
+        den = ndimage.gaussian_filter(m.astype(np.float32), sg)
+        dz = np.where(den > 0.2, num / np.maximum(den, 1e-6), 0)      # outside the DSM: the plane
+        self.z = (zpl + dz).astype(np.float32)
+        self.range = (float(np.percentile(dz[m], 0.5)), float(np.percentile(dz[m], 99.5)))
+
+    def height(self, x, y):
+        from scipy import ndimage
+        return ndimage.map_coordinates(self.z, [(self.y0 - y) / self.c - .5, (x - self.x0) / self.c - .5],
+                                       order=1, mode="nearest")
+
+
 RECT_INTERP = cv2.INTER_LINEAR   # rectification resampling
 PRIOR_ROUND = False              # round the plane-prior shift to whole pixels
 
 
-def process_pair(run, a, b, plane, grid, matcher_kw, level=1, verbose=True):
+def process_pair(run, a, b, plane, grid, matcher_kw, level=1, verbose=True, prior=None):
     ca, cb = run.cams[a], run.cams[b]
     Rr = rect_rotation(ca, cb)
     B = np.linalg.norm(cb.C - ca.C)
@@ -81,7 +117,8 @@ def process_pair(run, a, b, plane, grid, matcher_kw, level=1, verbose=True):
         return None
     poly = poly.reshape(-1, 2).astype(float)
     zpl = plane[0] + plane[1] * poly[:, 0] + plane[2] * poly[:, 1]
-    P = np.vstack([np.c_[poly, zpl + dz] for dz in (-3.0, 3.0)])
+    lo, hi = (-3.0, 3.0) if prior is None else (min(-3.0, prior.range[0] - 1), max(3.0, prior.range[1] + 1))
+    P = np.vstack([np.c_[poly, zpl + dz] for dz in (lo, hi)])
 
     def rect_uv(C):
         Xr = (P - C) @ Rr.T
@@ -114,6 +151,10 @@ def process_pair(run, a, b, plane, grid, matcher_kw, level=1, verbose=True):
     pa, pb, pc = plane
     t = (pa + pb * ca.C[0] + pc * ca.C[1] - ca.C[2]) / (dw[:, 2] - pb * dw[:, 0] - pc * dw[:, 1])
     X = ca.C + t[:, None] * dw
+    if prior is not None:        # ray -> prior DSM, fixed point (near-nadir rays converge in a few steps)
+        for _ in range(6):
+            t = (prior.height(X[:, 0], X[:, 1]) - ca.C[2]) / dw[:, 2]
+            X = ca.C + t[:, None] * dw
     Xb = (X - cb.C) @ Rr.T
     colb = f * Xb[:, 0] / Xb[:, 2] + cxb
     dprior = cv2.resize((colb - cc.ravel()).reshape(rc.shape).astype(np.float32), (W, H),
@@ -199,6 +240,9 @@ def main():
     ap.add_argument("--min-overlap", type=float, default=0.08)
     ap.add_argument("--img-dir", default=None, help="own undistorted images (kjr/undistort.py, Lanczos)")
     ap.add_argument("--meta-only", action="store_true", help="write stereo_meta.json (grid, pairs) and stop")
+    ap.add_argument("--prior-dsm", default=os.environ.get("REF_DSM") or None,
+                    help="DSM that centres the disparity search (default: $REF_DSM, else <run>/odm_dem/dsm.tif,"
+                         " else the SfM ground plane)")
     args = ap.parse_args()
 
     run = Run(args.run)
@@ -209,6 +253,10 @@ def main():
         from osgeo import gdal
         args.cell = 2 * gdal.Open(ortho).GetGeoTransform()[1]
     grid = grid_from_ortho(ortho, run.offset, args.cell)
+    pdsm = args.prior_dsm or os.path.join(args.run, "odm_dem/dsm.tif")
+    prior = PriorSurface(pdsm, run.offset, plane) if os.path.exists(pdsm) else None
+    print(f"disparity prior: {pdsm if prior else 'ground plane'}"
+          + (f", off-plane {prior.range[0]:+.2f}..{prior.range[1]:+.2f} m" if prior else ""), flush=True)
     os.makedirs(os.path.join(args.out, "pairs"), exist_ok=True)
     pairs, _ = select_pairs(run, plane, min_overlap=args.min_overlap)
     if args.only:
@@ -216,7 +264,8 @@ def main():
         pairs = [p for p in pairs if {p[0], p[1]} == {a, b}] or [(a, b, 0, 0)]
     if args.max_pairs:
         pairs = pairs[:args.max_pairs]
-    json.dump(dict(grid=grid, plane=list(plane), pairs=pairs, matcher=MATCHER, level=args.level),
+    json.dump(dict(grid=grid, plane=list(plane), pairs=pairs, matcher=MATCHER, level=args.level,
+                   prior_dsm=args.prior_dsm),
               open(os.path.join(args.out, "stereo_meta.json"), "w"), indent=1, default=str)
     print(f"plane z = {plane[0]:.3f} + {plane[1]:.2e} x + {plane[2]:.2e} y; "
           f"grid {grid['W']}x{grid['H']} @ {args.cell} m; {len(pairs)} pairs", flush=True)
@@ -228,7 +277,7 @@ def main():
         if os.path.exists(fn):
             continue
         print(f"[{k+1}/{len(pairs)}] overlap {ov:.2f}", flush=True)
-        res = process_pair(run, a, b, plane, grid, MATCHER, args.level)
+        res = process_pair(run, a, b, plane, grid, MATCHER, args.level, prior=prior)
         if res is None:
             continue
         arrs, info = res

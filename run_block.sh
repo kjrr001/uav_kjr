@@ -5,7 +5,7 @@
 #   ties     sub-pixel ties on the original JPEGs  -> work/ties  (SIFT -> MAGSAC++ -> ALSC, GPU)
 #   bba      own bundle adjustment + radial/grid image correction -> work/bba (+ work/bba/odm)
 #   undist   Lanczos undistortion with the new camera            -> work/images
-#   stereo   census-SGM per pair on the new images               -> work/stereo/pairs
+#   stereo   census-SGM per pair on the new images, search centred on the ODM DSM -> work/stereo/pairs
 #   fuse     robust fusion of the pair rasters                    -> work/stereo/dsm_fused.tif
 #   blend    long waves (> sigma) from ref, detail from stereo    -> work/final/dsm_fused.tif
 #   ortho    orthophoto from the final DSM                        -> work/final/ortho.tif
@@ -43,12 +43,13 @@ for f in "$ODM/opensfm/reconstruction.json" "$ODM/opensfm/undistorted/reconstruc
 done
 say "start: odm $ODM, images $SRC, gcp $GCP, stages: $STAGES"
 REF=${REF_DSM:-$W/ref/dsm_fused.tif}
+PRIOR=${REF_DSM:-$ODM/odm_dem/dsm.tif}     # centres the stereo search (+-8 px = only ~+-1 m of height)
 
 if want ref; then
   if [ -n "${REF_DSM:-}" ]; then
-    [ -f "$W/ref/stereo_meta.json" ] || { say "ref: pair list only (REF_DSM given)"; run $PY "$K/stereo.py" "$ODM" "$W/ref" --meta-only; }
+    [ -f "$W/ref/stereo_meta.json" ] || { say "ref: pair list only (REF_DSM given)"; run $PY "$K/stereo.py" "$ODM" "$W/ref" --meta-only --prior-dsm "$PRIOR"; }
   elif [ ! -f "$W/ref/dsm_fused.tif" ]; then
-    say "ref stereo (ODM cameras)"; run $PY "$K/stereo.py" "$ODM" "$W/ref"
+    say "ref stereo (ODM cameras)"; run $PY "$K/stereo.py" "$ODM" "$W/ref" --prior-dsm "$PRIOR"
     say "ref fuse";                 run $PY "$K/fuse.py" "$W/ref"
   fi
 fi
@@ -66,7 +67,7 @@ if want undist; then
   NAMES=$(ls "$SRC" | grep -i '\.jpg$' | sed 's/$/.tif/')
   say "undistort"; run $PY "$K/undistort.py" "$W/bba/odm" "$SRC" "$W/images" $NAMES
 fi
-if want stereo; then say "stereo"; run $PY "$K/stereo.py" "$W/bba/odm" "$W/stereo" --img-dir "$W/images"; fi
+if want stereo; then say "stereo"; run $PY "$K/stereo.py" "$W/bba/odm" "$W/stereo" --img-dir "$W/images" --prior-dsm "$PRIOR"; fi
 if want fuse && [ ! -f "$W/stereo/dsm_fused.tif" ]; then say "fuse"; run $PY "$K/fuse.py" "$W/stereo"; fi
 if want blend && [ ! -f "$W/final/dsm_fused.tif" ]; then
   mkdir -p "$W/final"

@@ -18,7 +18,8 @@ ODM으로 처리한 드론 블록에서 DSM과 정사영상을 다시 만드는 
 | DSM의 동심원·물결 무늬 (1–3 cm) | **카메라 모델 오차**. 무늬가 지면이 아니라 사진 좌표에 고정되어 있다. 모든 사진을 사진 좌표로 겹쳐 평균하면 짝수 사진 묶음과 홀수 사진 묶음의 무늬가 상관 0.8–0.9로 일치한다. ODM 자체 DSM(OpenMVS)에도 같은 무늬가 있으므로 정합기 문제가 아니다. | 번들 조정에서 사진 좌표 보정을 추정한다: 반경 30 px 간격 + 2차원 격자 64 px 간격 |
 | 동쪽 줄의 연속 사진 쌍 사이 단차 (10–18 cm) | ODM 카메라 자세 오차 | 자체 번들 조정 (tie point 약 108만 점) |
 | 고리 모양의 정합 편향 | OpenSfM 왜곡 보정의 bilinear 보간 | Lanczos로 왜곡 보정한 사진을 따로 만든다 |
-| 번들 조정 후 블록 전체가 휨 (±30 cm) | GCP 5점에 비해 보정 자유도가 크다 | 30 m보다 긴 파장은 ODM 카메라로 만든 참조 DSM에서 가져온다 (`lowblend`) |
+| 번들 조정 후 블록 전체가 휨 (±30 cm) | GCP 5점에 비해 보정 자유도가 크다 | 30 m보다 긴 파장은 참조 DSM(권장: ODM 자체 DSM)에서 가져온다 (`lowblend`) |
+| 지형이 높거나 낮은 곳이 노이즈로 덮임 (JJ-1 북쪽) | 정합 탐색 범위가 ±8 px뿐이다. 높이로는 ±1 m(기선 130 m), 기선이 긴 쌍은 ±0.5 m다. 처음에는 블록 전체를 평면 하나로 보고 그 주위만 찾았다. | 탐색 중심을 ODM DSM(1 m 평활)에 맞춘다 (`stereo.py --prior-dsm`). JJ-1 북쪽 쌍에서 ODM과 50 cm 넘게 다른 셀이 36% → 2.7% |
 
 시도했다가 버린 방법:
 - **내부표정(f, k1–k3)을 풀어서 추정**: 1 m 크기의 돔이 생겼다. 그래서 내부표정은 ODM 값으로 고정한다.
@@ -36,7 +37,7 @@ ODM으로 처리한 드론 블록에서 DSM과 정사영상을 다시 만드는 
 | `ties` | 원본 JPEG에서 tie point 추출 (GPU ALSC) | `ties/<a>__<b>.npz` | 약 50분 (242쌍) |
 | `bba` | 번들 조정 (LM + Schur 소거, Cauchy 가중) | `bba/bba.json`, `bba/bba.log`, `bba/odm/` | 약 25분 (30회 반복) |
 | `undist` | 새 카메라로 Lanczos 왜곡 보정 | `images/*.JPG.tif` | 약 1분 |
-| `stereo` | 사진 쌍별 census-SGM (pfsgbm, MGM, CUDA) | `stereo/pairs/*.npz` | 약 25분 |
+| `stereo` | 사진 쌍별 census-SGM (pfsgbm, MGM, CUDA). 탐색 중심은 ODM DSM | `stereo/pairs/*.npz` | 약 25분 |
 | `fuse` | 강건 융합 (중앙값 + NMAD, 가장자리·외곽 가중) | `stereo/dsm_fused.tif` | 약 20분 |
 | `blend` | 긴 파장(σ 30 m)은 `ref`, 세부는 `stereo` | `final/dsm_fused.tif` | 1분 |
 | `ortho` | 최종 DSM으로 정사영상 (가장 수직에 가까운 사진에 가중) | `final/ortho.tif` | 약 5분 |
