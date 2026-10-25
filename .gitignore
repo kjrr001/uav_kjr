@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.tif
+*.npz
+*.npy
+*.jpg
+*.png
+*.log
