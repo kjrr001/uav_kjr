@@ -71,7 +71,7 @@ if want stereo; then say "stereo"; run $PY "$K/stereo.py" "$W/bba/odm" "$W/stere
 if want fuse && [ ! -f "$W/stereo/dsm_fused.tif" ]; then say "fuse"; run $PY "$K/fuse.py" "$W/stereo"; fi
 if want blend && [ ! -f "$W/final/dsm_fused.tif" ]; then
   mkdir -p "$W/final"
-  say "blend (sigma $SIGMA m, reference $REF)"; run $PY "$K/lowblend.py" "$W/stereo/dsm_fused.tif" "$REF" "$W/final/dsm_fused.tif" --sigma "$SIGMA"
+  say "blend (sigma $SIGMA m, reference $REF)"; run $PY "$K/lowblend.py" "$W/stereo/dsm_fused.tif" "$REF" "$W/final/dsm_fused.tif" --sigma "$SIGMA" --gcp "$GCP"
 fi
 if want ortho && [ ! -f "$W/final/ortho.tif" ]; then
   say "ortho"; run $PY "$K/ortho.py" "$W/bba/odm" "$W/final" --img-dir "$W/images"
