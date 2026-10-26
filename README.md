@@ -29,3 +29,12 @@ threaded stereo and ortho. Details in MANUAL.md §2.1.
 
 Deliverables: `tools/export_products.sh` (DSM, ortho, small hillshade / ortho, image
 footprint map per block, context map on a regional DEM).
+
+## Without ODM (`run_noodm.sh`, experimental)
+
+EXIF/XMP initial cameras, GCP similarity alignment, self-calibrating bundle adjustment and a
+tie-point reference DSM replace the ODM run. It processes a block end to end, but with nadir-only
+parallel strips and few GCPs the lens distortion and the block curvature are not separable:
+KJ-3 leave-one-out check points RMS 80 cm self-calibrated, 37 cm with the camera calibration of
+another block (`CAMERA=`), 21 cm starting from ODM. Give a camera calibration and check with
+`CHECK=1`; see MANUAL 4.1.

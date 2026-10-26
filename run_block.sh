@@ -20,7 +20,8 @@
 # Env:   STAGES="ties bba ..." run only these (default: all, in order)
 #        REF_DSM=<tif>  use this as the long-wave reference instead of making ref/dsm_fused.tif
 #                       (recommended: <odm run>/odm_dem/dsm.tif; JJ-1 GCP RMS 8.3 vs 13.6 cm, 45 min less)
-#        SIGMA=30 (blend, m)  BBA_ITERS=30  TIE_WORKERS=2
+#        SHAPE_DSM=<tif>|self  long-wave shape for blend (default REF_DSM); self = keep the stereo DSM
+#        SIGMA=30 (blend, m)  BBA_ITERS=30  TIE_WORKERS=2  BBA_ARGS="--sig-gcp 0.03" (extra bba.py options)
 # Every stage skips when its output already exists: rerun after a failure resumes;
 # delete a stage's output to redo it.
 set -euo pipefail
@@ -47,6 +48,11 @@ for f in "$ODM/opensfm/reconstruction.json" "$ODM/opensfm/undistorted/reconstruc
 done
 say "start: odm $ODM, images $SRC, gcp $GCP, stages: $STAGES"
 REF=${REF_DSM:-$W/ref/dsm_fused.tif}
+case "${SHAPE_DSM:-}" in                     # long-wave shape for blend; "self": the stereo DSM itself
+  self) REF="$W/stereo/dsm_fused.tif" ;;    # (no long-wave change, GCP offset only)
+  "") ;;
+  *) REF="$SHAPE_DSM" ;;
+esac
 PRIOR=${REF_DSM:-$ODM/odm_dem/dsm.tif}     # centres the stereo search (+-8 px = only ~+-1 m of height)
 
 if want ref; then
@@ -69,7 +75,7 @@ fi
 rm -rf "$W/sift"                              # SIFT cache (~80 MB per image), only ties/tracks use it
 TRK=(); [ -f "$W/tracks.npz" ] && TRK=(--tracks "$W/tracks.npz")
 if want bba && [ ! -f "$W/bba/bba.json" ]; then
-  say "bba ($BBA_ITERS iterations)"; run $PY "$K/bba.py" "$ODM" "$W/ties" "$GCP" "$W/bba" --iters "$BBA_ITERS" "${TRK[@]}"
+  say "bba ($BBA_ITERS iterations)"; run $PY "$K/bba.py" "$ODM" "$W/ties" "$GCP" "$W/bba" --iters "$BBA_ITERS" "${TRK[@]}" ${BBA_ARGS:-}
   grep -E "^it |GCP . triangulated|grid correction" "$W/bba/bba.log" | tail -8 | tee -a "$LOG"
 fi
 if want undist; then

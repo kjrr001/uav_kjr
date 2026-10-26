@@ -131,7 +131,7 @@ KJ-1 예:
 ```bash
 cd /work/eridu_drone/kjr/odm-kjr
 ./run_block.sh KJ1 \
-    /work/eridu_drone/odm_data/KJ1_gcp \
+    /work/eridu_drone/odm_backup/kjr_inputs/KJ1_gcp \
     /work/eridu_drone/KJ-1 \
     /work/eridu_drone/final_output_kj1/gcp_list_final.txt \
     /work/eridu_drone/kjr/runs/KJ1 \
@@ -141,12 +141,51 @@ cd /work/eridu_drone/kjr/odm-kjr
 권장 실행 (ODM DSM을 참조로):
 
 ```bash
-REF_DSM=/work/eridu_drone/odm_data/KJ1_gcp/odm_dem/dsm.tif ./run_block.sh KJ1 ...
+REF_DSM=/work/eridu_drone/odm_backup/kjr_inputs/KJ1_gcp/odm_dem/dsm.tif ./run_block.sh KJ1 ...
 ```
 
 오래 걸리므로 `nohup ... &`로 띄우고 `<작업 폴더>/run_block.log`를 본다.
 
 **ODM 폴더와 원본 사진은 읽기만 한다.** 모든 결과는 작업 폴더와 제품 폴더에만 쓴다.
+(이 프로젝트의 ODM 중간 결과는 2026-10-27에 지웠다. KJR에 필요한 파일만 `/work/eridu_drone/odm_backup/kjr_inputs/<run>/`에 있다.)
+
+### 4.1 ODM 없이 처리 (`run_noodm.sh`)
+
+```bash
+./run_noodm.sh <블록> <원본 사진 폴더> <GCP 목록> <작업 폴더> <제품 폴더>
+```
+
+ODM이 하던 일을 다음 단계로 대신한다.
+
+| 단계 | 하는 일 | 코드 |
+|---|---|---|
+| `init` | EXIF/XMP에서 초기 카메라: GPS → UTM(경도로 영역 계산), 짐벌 요·피치·롤(없으면 비행 요, 그것도 없으면 GPS 진행 방향), 초점거리(DJI 보정값 → 35 mm 환산 → 초점거리 mm × 센서 해상도). 격자용 빈 정사영상 틀, coords.txt | `kjr/exif_init.py` |
+| `pairs` | EXIF 자세로 지상 범위 → 겹치는 사진 쌍 (겹침 5 % 이상) | `stereo.py --meta-only` |
+| `ties`, `tracks` | 기존과 같다 (자세와 무관한 정합) | `ties.py`, `tracks.py` |
+| `rel` | tie만으로 번들 조정, GPS를 약한 사전정보로 (5 m, 0.1 rad), 왜곡 0 고정 | `bba.py --no-gcp` |
+| `abs` | GCP를 삼각측량해 측량 좌표로 유사변환 (높이 기준면 포함), 그다음 GCP와 함께 번들 조정. `CAMERA`가 있으면 내부 파라미터 고정, 없으면 자체 보정 | `bba.py --align-gcp [--free-intr] --sig-gcp 0.03` |
+| (선택) `CHECK=1` | GCP를 하나씩 빼고 `abs`를 다시 풀어 검사점 오차 보고 | `bba.py --holdout` |
+| `refdsm` | 조정된 tie 점(약 150만 개)으로 2 m 참조 DSM → stereo 탐색 중심. 긴 파장 형태로는 쓰지 않는다 (`SHAPE_DSM=self`: KJ-3 GCP RMS 6.1 → 13.2 cm로 나빠졌음) | `kjr/refdsm.py` |
+| 이후 | `run_block.sh`를 `abs/odm`에 대해 실행 (보정 격자 BBA, stereo, 융합, 정사영상, 제품) | |
+
+필요 조건: 카메라 한 종류, 거의 연직인 사진, GPS, 2장 이상에서 보이는 GCP 3개 이상. `RelativeAltitude` 태그가 없으면 `EXIF_ARGS="--agl <비행고도 m>"`.
+
+**정확도 한계 (중요).** 모든 사진이 연직이고 비행선이 평행한 블록에서는 렌즈 왜곡(k1–k3, 초점거리)과 블록 곡률이 서로 맞바뀐다. GCP 5개로는 이 둘을 구분하지 못한다. KJ-3에서 GCP를 하나씩 빼고 검사점으로 쓴 결과:
+
+| 방식 | 검사점 높이 오차 (5점) | RMS |
+|---|---|---|
+| ODM 없이, 내부 파라미터 자유 자체 보정 (`--free-intr`, GCP 0.03 px) | +0.79, −0.64, +1.17, −0.55, +0.74 m | 약 80 cm |
+| 위 + OpenSfM 방식 내부 파라미터 사전정보 (`--intr-prior 0.01,...`) | 같음 (tie가 0.1 px로 매우 정확해서 사전정보가 묻힘) | 약 80 cm |
+| **ODM 없이, 같은 기종의 다른 블록(KJ-1) 보정값 고정 (`CAMERA=`)** | +0.43, −0.45, −0.01, −0.36, +0.44 m | **약 37 cm** |
+| 참고: ODM 해에서 시작 (같은 블록의 ODM 보정값) | −0.30, −0.10, +0.25, −0.09, −0.23 m | 약 21 cm |
+
+ODM 자신도 블록마다 다른 왜곡 계수를 냈다 (FC6310 다섯 블록: 초점거리 0.6626–0.6685, k2 −0.0045 ~ −0.0086). 같은 모호성을 블록마다 다르게 정한 것이다.
+GCP에 큰 가중치를 주면 GCP 자체는 잘 맞지만 (KJ-3 GCP RMS 6.1 cm) GCP 사이 형태는 검사점에서 수십 cm 틀린다. GPS 높이를 카메라 사전정보로 넣는 방법(`--gps-prior`)도 효과가 없었다 (사진별 GPS 높이 잡음 0.6 m).
+보정값이 없는 카메라(JJ-3, FC9313: 35 mm 환산값 24 mm로 f 2840 px)는 자체 보정이 초점거리를 10 % 틀리게 잡았다 (0.601 대 ODM 0.666).
+
+그래서:
+- 이 블록들처럼 연직만 찍은 자료는 **ODM 해에서 시작하는 `run_block.sh`가 여전히 가장 정확하다.**
+- `run_noodm.sh`는 ODM 없이 끝까지 처리할 수 있게 해 준다. 하지만 **카메라 보정값(`CAMERA=`)을 주거나**, 교차·경사 비행선이나 GCP가 많은 블록에서 써야 한다. 결과는 반드시 `CHECK=1`(GCP leave-one-out 검사점)로 확인한다.
 
 ### 환경변수 옵션
 

@@ -235,7 +235,7 @@ def align_to_gcp(rv, t, model, ip, g_cam, g_uv, g_X, g_id, say):
     ok = nv >= 2
     if ok.sum() < 3:
         say(f"align-gcp: only {ok.sum()} GCPs seen in 2+ images - not aligned")
-        return rv, t
+        return rv, t, None
     A, B = Xg[ok], Xs[ok]
     ma, mb = A.mean(0), B.mean(0)
     U, S, Vt = np.linalg.svd((B - mb).T @ (A - ma))
@@ -251,17 +251,35 @@ def align_to_gcp(rv, t, model, ip, g_cam, g_uv, g_X, g_id, say):
     rv2 = Rotation.from_matrix(R2).as_rotvec()
     say(f"align-gcp: {ok.sum()} GCPs, scale {sc:.5f}, rotation {np.degrees(Rotation.from_matrix(Q).magnitude()):.3f} deg, "
         f"mean camera shift {np.round((C2 - C).mean(0), 2)} m; residual RMS {np.sqrt((res ** 2).sum(1).mean()):.2f} m")
-    return rv2, t2
+    return rv2, t2, (sc, Q, T)
 
 
 def main():
-    global SIG_T, SIG_ROT
+    global SIG_T, SIG_ROT, SIG_GCP
     ap = argparse.ArgumentParser()
     ap.add_argument("odm"); ap.add_argument("ties"); ap.add_argument("gcp"); ap.add_argument("out")
     ap.add_argument("--iters", type=int, default=12)
     ap.add_argument("--sig-t", type=float, default=SIG_T, help="m, camera centre prior to the input solution")
     ap.add_argument("--sig-rot", type=float, default=SIG_ROT, help="rad, rotation prior to the input solution")
     ap.add_argument("--no-gcp", action="store_true", help="ties only (GCP list ignored)")
+    ap.add_argument("--gps-prior", default=None, metavar="SXY,SZ",
+                    help="camera centres to the shots' gps_position (moved by --align-gcp), sigmas in m."
+                         " Holds the block curvature that nadir parallel strips leave free (KJ-3 from EXIF:"
+                         " cameras domed +0.8 m against GPS, GCP heights -0.3..+0.7 m)")
+    ap.add_argument("--sig-gcp", type=float, default=SIG_GCP,
+                    help="px, GCP observation sigma. Millions of ties outweigh 20 GCP observations at"
+                         " the marking accuracy (0.3 px): with self-calibration the GCPs cannot hold"
+                         " the block shape; a smaller sigma gives them the weight they need")
+    ap.add_argument("--holdout", default=None,
+                    help="GCP id left out of the adjustment (check point): its triangulated error is reported")
+    ap.add_argument("--intr-prior", default=None, metavar="F,C,K,P",
+                    help="with --free-intr: priors of the intrinsics to the input values (OpenSfM's"
+                         " defaults: 0.01,0.01,0.01,0.01 = focal 1 %%, principal point, k1-k3, p1-p2"
+                         " sigma 0.01 in normalised units). Free intrinsics with nadir parallel strips"
+                         " bend the block (KJ-3 check points up to 1.2 m)")
+    ap.add_argument("--fix-focal", action="store_true",
+                    help="with --free-intr: keep the focal at the input value (EXIF start: f trades with"
+                         " block curvature, KJ-3 f +1.4 %% -> GCP heights -0.3..+0.7 m)")
     ap.add_argument("--align-gcp", action="store_true",
                     help="first move the input cameras by the similarity that maps the GCPs triangulated"
                          " from them onto the surveyed ones (input from GPS/EXIF: datum, heights)")
@@ -275,7 +293,7 @@ def main():
                     help="also adjust f, cx, cy, k1-k3, p1, p2. Off by default: on KJ-1 (parallel nadir"
                          " strips, 5 GCPs) f and k1-k3 trade with block curvature -> a 1 m dome")
     args = ap.parse_args()
-    SIG_T, SIG_ROT = args.sig_t, args.sig_rot
+    SIG_T, SIG_ROT, SIG_GCP = args.sig_t, args.sig_rot, args.sig_gcp
     os.makedirs(args.out, exist_ok=True)
     log = open(os.path.join(args.out, "bba.log"), "a")
 
@@ -306,9 +324,30 @@ def main():
         g_cam.append(idx[s[5]]); g_uv.append([float(s[3]), float(s[4])])
         g_X.append([float(s[0]) - off[0], float(s[1]) - off[1], float(s[2])]); g_id.append(s[6] if len(s) > 6 else "")
     g_cam = np.array(g_cam, int); g_uv = np.array(g_uv, float).reshape(-1, 2); g_X = np.array(g_X, float).reshape(-1, 3)
+    hold = np.array([x == args.holdout for x in g_id], bool)
+    h_cam, h_uv, h_X = g_cam[hold], g_uv[hold], g_X[hold]
+    g_cam, g_uv, g_X = g_cam[~hold], g_uv[~hold], g_X[~hold]
+    g_id = [x for x, hh in zip(g_id, hold) if not hh]
+    if hold.any():
+        say(f"check point (held out): GCP {args.holdout}, {hold.sum()} observations")
     say(f"GCP observations: {len(g_cam)}")
+    Cgps = np.array([rec["shots"][n].get("gps_position", [np.nan] * 3) for n in names], float)
     if args.align_gcp and len(g_cam):
-        rv0, t0 = align_to_gcp(rv0, t0, model, ip0, g_cam, g_uv, g_X, g_id, say)
+        rv0, t0, sim = align_to_gcp(rv0, t0, model, ip0, g_cam, g_uv, g_X, g_id, say)
+        if sim is not None:
+            sc, Q, T = sim
+            Cgps = sc * Cgps @ Q.T + T
+    intr_sig = None
+    if args.intr_prior:
+        f_, c_, k_, p_ = [float(v) for v in args.intr_prior.split(",")]
+        intr_sig = np.array([f_ * ip0[0], c_, c_, k_, k_, k_, p_, p_])    # order INTR
+        say(f"intrinsic priors: focal {f_*100:.1f} %, c {c_}, k {k_}, p {p_}")
+    gps_sig = None
+    if args.gps_prior:
+        gps_sig = np.array([float(v) for v in args.gps_prior.split(",")])[[0, 0, 1]]
+        if not np.isfinite(Cgps).all():
+            raise SystemExit("--gps-prior: shots without gps_position")
+        say(f"GPS prior on camera centres: sigma {gps_sig[0]} m horizontal, {gps_sig[2]} m vertical")
 
     dr = np.zeros(model.nq)                  # all corrections (name kept: dr = q)
     rv, t, ip = rv0.copy(), t0.copy(), ip0.copy()
@@ -372,18 +411,33 @@ def main():
     D2s = sparse.vstack([sparse.hstack([D[0], sparse.csr_matrix((D[0].shape[0], 2 * model.ng))])] + D[1:]).tocsr()
     sig0 = np.r_[np.full(model.nr, SIG_DR), np.full(2 * model.ng, SIG_G)]
 
-    def prior_terms(rv, t, dr):
+    def prior_terms(rv, t, dr, ip):
         rows = [((rv - rv0) / SIG_ROT).ravel(), ((t - t0) / SIG_T).ravel()]
         if ndr:
             rows += [dr / sig0, D2s @ dr, Bq.T @ dr / SIG_ORTH]
         if not args.free_intr:
             rows.append((ip - ip0) / SIG_FIX)
+        elif intr_sig is not None:
+            rows.append((ip - ip0) / intr_sig)
         return np.concatenate(rows)
+
+    def gps_terms(rv, t):
+        """residuals (nc, 3) and Jacobian (nc, 3, 6) [rot, t] of (C - C_gps) / sigma"""
+        R = rot(rv)
+        C = -np.einsum("nji,nj->ni", R, t)
+        r = (C - Cgps) / gps_sig
+        J = np.empty((nc, 3, 6))
+        for j in range(3):
+            h = 1e-7; d = np.zeros(3); d[j] = h
+            J[:, :, j] = (-np.einsum("nji,nj->ni", rot(rv + d), t) - C) / h / gps_sig
+        J[:, :, 3:] = -np.transpose(R, (0, 2, 1)) / gps_sig[None, :, None]
+        return r, J
 
     def cost(rv, t, ip, dr, X, c):
         r_t, r_g = residuals(rv, t, ip, dr, X)
         _, ct = robust_w(r_t, c)
-        return ct + (r_g ** 2).sum() + (prior_terms(rv, t, dr) ** 2).sum()
+        cg = (gps_terms(rv, t)[0] ** 2).sum() if gps_sig is not None else 0.0
+        return ct + (r_g ** 2).sum() + (prior_terms(rv, t, dr, ip) ** 2).sum() + cg
 
     def jac(rv, t, ip, dr, X, cam_, uvX, fixedX, sig):
         """d(px)/d(params) for observations of cameras cam_ at points uvX.
@@ -473,7 +527,6 @@ def main():
             U = (Jg.T @ Jg).toarray() + (Jgcp.T @ Jgcp).toarray()
             bg = Jg.T @ rt.ravel() + Jgcp.T @ r_g.ravel()
         # priors (linear)
-        pr = prior_terms(rv, t, dr)
         dpr = np.zeros(NG)
         Up = np.zeros(NG)
         Up[:6 * nc] = np.tile(np.r_[np.full(3, SIG_ROT ** -2), np.full(3, SIG_T ** -2)], nc)
@@ -481,7 +534,19 @@ def main():
         if not args.free_intr:
             Up[o_int:o_int + 8] = SIG_FIX ** -2
             dpr[o_int:o_int + 8] = (ip - ip0) / SIG_FIX ** 2
+        else:
+            if intr_sig is not None:
+                Up[o_int:o_int + 8] = intr_sig ** -2
+                dpr[o_int:o_int + 8] = (ip - ip0) / intr_sig ** 2
+            if args.fix_focal:
+                Up[o_int] = SIG_FIX ** -2
+                dpr[o_int] = (ip[0] - ip0[0]) / SIG_FIX ** 2
         U[np.diag_indices(NG)] += Up
+        if gps_sig is not None:
+            rgp, Jgp = gps_terms(rv, t)
+            for k in range(nc):
+                U[6 * k:6 * k + 6, 6 * k:6 * k + 6] += Jgp[k].T @ Jgp[k]
+                dpr[6 * k:6 * k + 6] += Jgp[k].T @ rgp[k]
         if ndr:
             Pd = np.diag(sig0 ** -2.0) + (D2s.T @ D2s).toarray() + Bq @ Bq.T / SIG_ORTH ** 2
             U[o_dr:, o_dr:] += Pd
@@ -549,6 +614,10 @@ def main():
     for k, u in enumerate(ug):
         Xk = g_X[gid == u][0]
         say(f"  GCP {u} triangulated - surveyed: dX {Xg[k, 0] - Xk[0]:+.3f} dY {Xg[k, 1] - Xk[1]:+.3f} dZ {Xg[k, 2] - Xk[2]:+.3f} m")
+    if len(h_cam) >= 2:
+        Xh = triangulate(R, t, model, ip, dr, h_cam, h_uv, np.zeros(len(h_cam), int), 1)[0]
+        say(f"  CHECK POINT {args.holdout} triangulated - surveyed: dX {Xh[0] - h_X[0, 0]:+.3f} "
+            f"dY {Xh[1] - h_X[0, 1]:+.3f} dZ {Xh[2] - h_X[0, 2]:+.3f} m")
     for k in range(len(g_cam)):
         say(f"  GCP {g_id[k]} {names[g_cam[k]]} res {gres[k, 0]:+.2f} {gres[k, 1]:+.2f} px")
 
