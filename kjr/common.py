@@ -53,9 +53,9 @@ class Run:
         self.names = sorted(self.cams)
         self.sparse = np.array([p["coordinates"] for p in rec["points"].values()], float)
         with open(os.path.join(run_dir, "odm_georeferencing/coords.txt")) as f:
-            f.readline()
+            zone = f.readline().split()[-1]            # "WGS84 UTM 38N"
             self.offset = np.array(list(map(float, f.readline().split()[:2])))
-        self.epsg = 32638
+        self.epsg = (32600 if zone[-1].upper() == "N" else 32700) + int(zone[:-1])
 
     img_dir = None    # override: own undistorted images (kjr/undistort.py), same names
 

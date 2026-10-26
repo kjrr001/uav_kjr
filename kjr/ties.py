@@ -14,7 +14,8 @@ SIFT -> guided GPU matching -> MAGSAC++ (F, 1 px) -> Gruen ALSC (cuda, UAV libra
 Pairs: the overlapping pairs of a stereo run (stereo_meta.json), including cross-strip pairs.
 Each pair keeps its own 2-view ties (ALSC moves only the second image's point; multi-view
 tracks are grouped on the first image's unmoved SIFT position, kjr/bba.py).
-Writes <out>/ties/<a>__<b>.npz with pa, pb (n,2) px (x = column, y = row).
+Writes <out>/ties/<a>__<b>.npz with pa, pb (n,2) px (x = column, y = row) and, for guided
+pairs, ka, kb: the SIFT keypoint indices of each tie (kjr/tracks.py links them across pairs).
 Usage: ties.py <stereo meta json> <original image dir> <out> [--workers 2] [--flann]
 """
 import argparse, json, os, shutil, sys, time
@@ -105,7 +106,7 @@ def guided_match(xyL, dL, rL, xyR, dR, rR, shape):
     qi = np.concatenate(qi); ti = np.concatenate(ti)
     u, cnt = np.unique(ti, return_counts=True)        # one keypoint taken by several: ambiguous
     keep = ~np.isin(ti, u[cnt > 1])
-    return xyL[qi[keep]].astype(np.float64), xyR[ti[keep]].astype(np.float64)
+    return xyL[qi[keep]].astype(np.float64), xyR[ti[keep]].astype(np.float64), qi[keep], ti[keep]
 
 
 def refine(A, B, pl, pr, st):
@@ -115,7 +116,7 @@ def refine(A, B, pl, pr, st):
     F, m = cv2.findFundamentalMat(pl.astype(np.float32), pr.astype(np.float32),
                                   cv2.USAC_MAGSAC, 1.0, 0.9999, 20000)
     if m is None:
-        return np.zeros((0, 2)), np.zeros((0, 2))
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0, bool)
     m = m.ravel().astype(bool)
     pl, pr = pl[m], pr[m]
     st["ransac_F"] = int(m.sum())
@@ -129,7 +130,8 @@ def refine(A, B, pl, pr, st):
     q = np.stack([r.i2, r.j2], 1)
     good = (np.asarray(r.status) == 0) & np.all(np.isfinite(q), 1) & (np.hypot(*(q - pr).T) <= 2.0)
     st["final"] = int(good.sum())
-    return pl[good], q[good]
+    sel = np.nonzero(m)[0][good]                      # rows of the input kept
+    return pl[good], q[good], sel
 
 
 def job(t):
@@ -143,6 +145,7 @@ def job(t):
         try:
             st = {}
             res = None
+            ka = kb = None
             if not flann:
                 ld = lambda n, e: np.load(os.path.join(cdir, n + e))
                 res = guided_match(ld(a, ".xy.npy"), ld(a, ".d.npy"), ld(a, ".rsp.npy"),
@@ -154,7 +157,8 @@ def job(t):
                 tp = match_pair(A, B, backend="sift", alsc="cuda", max_points=None)
                 pa, pb, st = tp.pi, tp.pj, dict(tp.stats, fallback=1)
             else:
-                pa, pb = refine(A, B, res[0], res[1], st)
+                pa, pb, sel = refine(A, B, res[0], res[1], st)
+                ka, kb = res[2][sel].astype(np.int32), res[3][sel].astype(np.int32)
             break
         except RuntimeError:          # ALSC status -100 / CUDA OOM: another worker holds the GPU
             import torch
@@ -162,7 +166,8 @@ def job(t):
             time.sleep(5 + 10 * np.random.rand())
     else:
         raise RuntimeError(f"{a} {b}: kept failing")
-    np.savez(dst, pa=np.asarray(pa, np.float64), pb=np.asarray(pb, np.float64))
+    extra = {} if ka is None else dict(ka=ka, kb=kb)   # SIFT keypoint indices (kjr/tracks.py)
+    np.savez(dst, pa=np.asarray(pa, np.float64), pb=np.asarray(pb, np.float64), **extra)
     return a, b, (st.get("ransac_F", 0), st.get("final", 0), time.time() - t0, st.get("fallback", 0))
 
 

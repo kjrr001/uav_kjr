@@ -8,7 +8,7 @@ the normalised distance from the image centre, so the most nadir image
 dominates and image edges fade out without hard seams. Pixels outside the DSM
 coverage are transparent, so ortho and DSM share one footprint.
 
-Writes <out>/ortho.tif (RGBA, tiled, DEFLATE, EPSG:32638).
+Writes <out>/ortho.tif (RGBA, tiled, DEFLATE, CRS of the grid ortho).
 Usage: ortho.py <odm run> <dir with dsm_fused.tif> [--ortho ref_ortho.tif] [--img-dir dir]
 """
 import argparse

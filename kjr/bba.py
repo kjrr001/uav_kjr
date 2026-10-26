@@ -205,10 +205,68 @@ def load_ties(tie_dir, names, max_obs=MAX_OBS):
     return cam[keep], uv[keep], pt[keep], npt
 
 
+def load_tracks(path, names, max_obs=MAX_OBS):
+    """multi-view tracks of kjr/tracks.py (one ground point per track, every observation
+    measured from the track's reference). Above max_obs whole tracks are thinned."""
+    d = np.load(path)
+    idx = {n: k for k, n in enumerate(names)}
+    tn = [str(n) for n in d["names"]]
+    m = np.array([idx.get(n, -1) for n in tn])
+    cam, uv, pt = m[d["cam"]], d["uv"], d["pt"]
+    keep = cam >= 0
+    if keep.sum() > max_obs:
+        h = np.sin(pt * 12.9898 + 78.233) * 43758.5453
+        keep &= (h - np.floor(h)) < max_obs / keep.sum()
+    cam, uv, pt = cam[keep], uv[keep], pt[keep]
+    ok = np.bincount(pt)[pt] >= 2
+    cam, uv, pt = cam[ok], uv[ok], pt[ok]
+    _, pt = np.unique(pt, return_inverse=True)
+    return cam, uv, pt, pt.max() + 1
+
+
+def align_to_gcp(rv, t, model, ip, g_cam, g_uv, g_X, g_id, say):
+    """Similarity (scale, rotation, shift; Umeyama) taking the GCPs triangulated from the
+    input cameras onto the surveyed coordinates, applied to the cameras."""
+    ug = sorted(set(g_id)); gi = np.array([ug.index(x) for x in g_id])
+    nv = np.bincount(gi, minlength=len(ug))
+    R = rot(rv)
+    Xg = triangulate(R, t, model, ip, np.zeros(model.nq), g_cam, g_uv, gi, len(ug))
+    Xs = np.array([g_X[gi == k][0] for k in range(len(ug))])
+    ok = nv >= 2
+    if ok.sum() < 3:
+        say(f"align-gcp: only {ok.sum()} GCPs seen in 2+ images - not aligned")
+        return rv, t
+    A, B = Xg[ok], Xs[ok]
+    ma, mb = A.mean(0), B.mean(0)
+    U, S, Vt = np.linalg.svd((B - mb).T @ (A - ma))
+    D = np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))])
+    Q = U @ D @ Vt
+    sc = np.trace(np.diag(S) @ D) / ((A - ma) ** 2).sum()
+    T = mb - sc * Q @ ma
+    res = (sc * (Q @ A.T)).T + T - B
+    C = -np.einsum("nji,nj->ni", R, t)
+    C2 = sc * C @ Q.T + T
+    R2 = R @ Q.T
+    t2 = -np.einsum("nij,nj->ni", R2, C2)
+    rv2 = Rotation.from_matrix(R2).as_rotvec()
+    say(f"align-gcp: {ok.sum()} GCPs, scale {sc:.5f}, rotation {np.degrees(Rotation.from_matrix(Q).magnitude()):.3f} deg, "
+        f"mean camera shift {np.round((C2 - C).mean(0), 2)} m; residual RMS {np.sqrt((res ** 2).sum(1).mean()):.2f} m")
+    return rv2, t2
+
+
 def main():
+    global SIG_T, SIG_ROT
     ap = argparse.ArgumentParser()
     ap.add_argument("odm"); ap.add_argument("ties"); ap.add_argument("gcp"); ap.add_argument("out")
     ap.add_argument("--iters", type=int, default=12)
+    ap.add_argument("--sig-t", type=float, default=SIG_T, help="m, camera centre prior to the input solution")
+    ap.add_argument("--sig-rot", type=float, default=SIG_ROT, help="rad, rotation prior to the input solution")
+    ap.add_argument("--no-gcp", action="store_true", help="ties only (GCP list ignored)")
+    ap.add_argument("--align-gcp", action="store_true",
+                    help="first move the input cameras by the similarity that maps the GCPs triangulated"
+                         " from them onto the surveyed ones (input from GPS/EXIF: datum, heights)")
+    ap.add_argument("--tracks", default=None,
+                    help="multi-view tracks (kjr/tracks.py tracks.npz) instead of the pairwise ties")
     ap.add_argument("--no-dr", action="store_true", help="brown only (no radial correction)")
     ap.add_argument("--tol", type=float, default=1e-5, help="stop when the relative cost decrease is below this")
     ap.add_argument("--sparse-schur", action="store_true",
@@ -217,6 +275,7 @@ def main():
                     help="also adjust f, cx, cy, k1-k3, p1, p2. Off by default: on KJ-1 (parallel nadir"
                          " strips, 5 GCPs) f and k1-k3 trade with block curvature -> a 1 m dome")
     args = ap.parse_args()
+    SIG_T, SIG_ROT = args.sig_t, args.sig_rot
     os.makedirs(args.out, exist_ok=True)
     log = open(os.path.join(args.out, "bba.log"), "a")
 
@@ -235,19 +294,21 @@ def main():
     nc = len(names)
 
     # ---------------- observations
-    cam, uv, pt, npt = load_ties(args.ties, names)
+    cam, uv, pt, npt = load_tracks(args.tracks, names) if args.tracks else load_ties(args.ties, names)
     say(f"ties: {npt} points, {len(cam)} observations, "
         f"views/point mean {len(cam) / npt:.2f}, >=3 views {np.mean(np.bincount(pt) >= 3) * 100:.0f}%")
     idx = {n: k for k, n in enumerate(names)}
     g_cam, g_uv, g_X, g_id = [], [], [], []
-    for line in open(args.gcp):
+    for line in ([] if args.no_gcp else open(args.gcp)):
         s = line.split()
         if len(s) < 6 or s[5] not in idx:
             continue
         g_cam.append(idx[s[5]]); g_uv.append([float(s[3]), float(s[4])])
         g_X.append([float(s[0]) - off[0], float(s[1]) - off[1], float(s[2])]); g_id.append(s[6] if len(s) > 6 else "")
-    g_cam, g_uv, g_X = np.array(g_cam), np.array(g_uv), np.array(g_X)
+    g_cam = np.array(g_cam, int); g_uv = np.array(g_uv, float).reshape(-1, 2); g_X = np.array(g_X, float).reshape(-1, 3)
     say(f"GCP observations: {len(g_cam)}")
+    if args.align_gcp and len(g_cam):
+        rv0, t0 = align_to_gcp(rv0, t0, model, ip0, g_cam, g_uv, g_X, g_id, say)
 
     dr = np.zeros(model.nq)                  # all corrections (name kept: dr = q)
     rv, t, ip = rv0.copy(), t0.copy(), ip0.copy()
@@ -273,7 +334,8 @@ def main():
 
     # gauge / sanity: GCP reprojection with the ODM solution
     g_res = model.project(cam_xc(R, t, g_cam, g_X), ip, dr) - g_uv
-    say(f"ODM solution: GCP reprojection RMS {np.sqrt((g_res ** 2).sum(1).mean()):.2f} px")
+    if len(g_cam):
+        say(f"input solution: GCP reprojection RMS {np.sqrt((g_res ** 2).sum(1).mean()):.2f} px")
 
     ndr = 0 if args.no_dr else model.nq
     NG = 6 * nc + 8 + ndr          # global unknowns: poses, intrinsics, corrections
@@ -353,6 +415,8 @@ def main():
     def sparse_global(cam_, Jc, Ji, Jd, i0, w):
         """(2n x NG) sparse matrix of sqrt(w)-weighted global Jacobian rows."""
         n = len(cam_)
+        if n == 0:
+            return sparse.csr_matrix((0, NG))
         sw = np.sqrt(w)[:, None, None]
         Jc, Ji, Jd = Jc * sw, Ji * sw, Jd * sw
         rows = np.repeat(np.arange(2 * n), 6 + 8 + (10 if ndr else 0))
@@ -478,10 +542,10 @@ def main():
     say("dr nodes (px): " + " ".join(f"{x:+.3f}" for x in dr[:model.nr]))
     gq = dr[model.nr:].reshape(2, model.gy, model.gx)
     say(f"grid correction: x std {gq[0].std():.3f} max {np.abs(gq[0]).max():.3f}, y std {gq[1].std():.3f} max {np.abs(gq[1]).max():.3f} px")
-    gres = model.project(cam_xc(R, t, g_cam, g_X), ip, dr) - g_uv
-    gid = np.array(g_id); ug = sorted(set(g_id))
+    gres = model.project(cam_xc(R, t, g_cam, g_X), ip, dr) - g_uv if len(g_cam) else np.zeros((0, 2))
+    gid = np.array(g_id); ug = sorted(set(g_id)) if len(g_cam) else []
     gi = np.array([ug.index(x) for x in g_id])
-    Xg = triangulate(R, t, model, ip, dr, g_cam, g_uv, gi, len(ug))
+    Xg = triangulate(R, t, model, ip, dr, g_cam, g_uv, gi, len(ug)) if len(ug) else []
     for k, u in enumerate(ug):
         Xk = g_X[gid == u][0]
         say(f"  GCP {u} triangulated - surveyed: dX {Xg[k, 0] - Xk[0]:+.3f} dY {Xg[k, 1] - Xk[1]:+.3f} dZ {Xg[k, 2] - Xk[2]:+.3f} m")
@@ -511,6 +575,7 @@ def main():
     shutil.copy(os.path.join(args.odm, "odm_georeferencing/coords.txt"), os.path.join(od, "odm_georeferencing/coords.txt"))
     if not os.path.exists(os.path.join(od, "odm_orthophoto")):      # output grid reference only (read only)
         os.symlink(os.path.join(os.path.abspath(args.odm), "odm_orthophoto"), os.path.join(od, "odm_orthophoto"))
+    np.save(os.path.join(args.out, "points.npy"), X.astype(np.float32))   # all tie points (kjr/refdsm.py)
     pts = {}   # a sparse subset of the adjusted tie points (ground plane fit in stereo.py)
     sel = np.linspace(0, npt - 1, min(npt, 100000)).astype(int)
     for k in sel:

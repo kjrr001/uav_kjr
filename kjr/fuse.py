@@ -197,34 +197,45 @@ def fuse_once_gpu(win, cdir, H, W, tile=1024):
         mm[f] = (np.load(os.path.join(cdir, k + ".z.npy"), mmap_mode="r"),
                  np.load(os.path.join(cdir, k + ".w.npy"), mmap_mode="r"))
     inf = float("inf")
+    budget = 96 << 20         # float32 cells per stack (sort needs a few copies): JJ-3 has ~100 pairs
+                              # over one 1024 tile, 1.3 GB per copy, which ran out of the 8 GB card
+
+    def one(tr, tc, th, tw):
+        hits = [x for x in win if x[1] < tr + th and x[1] + x[3] > tr and x[2] < tc + tw and x[2] + x[4] > tc]
+        if not hits:
+            return
+        if len(hits) * th * tw * 4 > budget and th > 64:      # split the tile in four
+            h2, w2 = th // 2, tw // 2
+            for a, b, hh, ww in ((tr, tc, h2, w2), (tr, tc + w2, h2, tw - w2),
+                                 (tr + h2, tc, th - h2, w2), (tr + h2, tc + w2, th - h2, tw - w2)):
+                one(a, b, hh, ww)
+            return
+        stack = np.full((len(hits), th, tw), np.nan, np.float32)
+        wst = np.zeros((len(hits), th, tw), np.float32)
+        for k, (f, r0, c0, h, w) in enumerate(hits):
+            z, wg = mm[f]
+            ra, rb = max(tr, r0), min(tr + th, r0 + h)
+            ca, cb = max(tc, c0), min(tc + tw, c0 + w)
+            stack[k, ra - tr:rb - tr, ca - tc:cb - tc] = z[ra - r0:rb - r0, ca - c0:cb - c0]
+            wst[k, ra - tr:rb - tr, ca - tc:cb - tc] = wg[ra - r0:rb - r0, ca - c0:cb - c0]
+        S = torch.from_numpy(stack).to(dev); Wt = torch.from_numpy(wst).to(dev)
+        fin = torch.isfinite(S)
+        n = fin.sum(0)
+        med = _sorted_median(torch.sort(torch.where(fin, S, inf), 0).values, n)
+        dev_ = (S - med).abs()
+        fd = torch.isfinite(dev_)
+        mad = _sorted_median(torch.sort(torch.where(fd, dev_, inf), 0).values, fd.sum(0))
+        tol = torch.clamp(3 * 1.4826 * torch.nan_to_num(mad, nan=0.0), min=0.05)
+        keep = fd & (dev_ <= tol)
+        wk = torch.where(keep, torch.clamp(Wt, min=1e-3), torch.zeros_like(Wt))
+        sm = (torch.where(keep, S, torch.zeros_like(S)) * wk).sum(0); c = wk.sum(0)
+        out = torch.where(c > 0, sm / torch.clamp(c, min=1e-9), torch.full_like(c, float("nan")))
+        dsm[tr:tr + th, tc:tc + tw] = out.cpu().numpy()
+        npr[tr:tr + th, tc:tc + tw] = n.clamp(max=255).to(torch.uint8).cpu().numpy()
+
     for tr in range(0, H, tile):
         for tc in range(0, W, tile):
-            th, tw = min(tile, H - tr), min(tile, W - tc)
-            hits = [x for x in win if x[1] < tr + th and x[1] + x[3] > tr and x[2] < tc + tw and x[2] + x[4] > tc]
-            if not hits:
-                continue
-            stack = np.full((len(hits), th, tw), np.nan, np.float32)
-            wst = np.zeros((len(hits), th, tw), np.float32)
-            for k, (f, r0, c0, h, w) in enumerate(hits):
-                z, wg = mm[f]
-                ra, rb = max(tr, r0), min(tr + th, r0 + h)
-                ca, cb = max(tc, c0), min(tc + tw, c0 + w)
-                stack[k, ra - tr:rb - tr, ca - tc:cb - tc] = z[ra - r0:rb - r0, ca - c0:cb - c0]
-                wst[k, ra - tr:rb - tr, ca - tc:cb - tc] = wg[ra - r0:rb - r0, ca - c0:cb - c0]
-            S = torch.from_numpy(stack).to(dev); Wt = torch.from_numpy(wst).to(dev)
-            fin = torch.isfinite(S)
-            n = fin.sum(0)
-            med = _sorted_median(torch.sort(torch.where(fin, S, inf), 0).values, n)
-            dev_ = (S - med).abs()
-            fd = torch.isfinite(dev_)
-            mad = _sorted_median(torch.sort(torch.where(fd, dev_, inf), 0).values, fd.sum(0))
-            tol = torch.clamp(3 * 1.4826 * torch.nan_to_num(mad, nan=0.0), min=0.05)
-            keep = fd & (dev_ <= tol)
-            wk = torch.where(keep, torch.clamp(Wt, min=1e-3), torch.zeros_like(Wt))
-            sm = (torch.where(keep, S, torch.zeros_like(S)) * wk).sum(0); c = wk.sum(0)
-            out = torch.where(c > 0, sm / torch.clamp(c, min=1e-9), torch.full_like(c, float("nan")))
-            dsm[tr:tr + th, tc:tc + tw] = out.cpu().numpy()
-            npr[tr:tr + th, tc:tc + tw] = n.clamp(max=255).to(torch.uint8).cpu().numpy()
+            one(tr, tc, min(tile, H - tr), min(tile, W - tc))
     return dsm, npr
 
 
@@ -243,7 +254,8 @@ def median7(a, rows=256):
     return out
 
 
-LOWN_SIGMA = 3.0      # cells: Gaussian for cells seen by 1 pair (2 pairs: half of it blended)
+LOWN_SIGMA = 2.0      # cells: Gaussian blended into cells seen by 1-2 pairs
+LOWN_KEEP1 = 0.35     # weight of the original value where 1 pair sees the cell (2 pairs: 0.675)
 LOWN_SPIKE = 0.12     # m: spike threshold there (0.25 elsewhere)
 
 
@@ -251,14 +263,15 @@ def lown_smooth(dsm, npr, sigma=LOWN_SIGMA):
     """Cells with 1-2 pairs carry ~2x the fine noise of the rest (high-pass p95 14-17 vs
     5-6 cm, JJ-1 / JJ-2 / KJ-3): no outlier test is possible with one or two values. They
     are blended towards a NaN-aware Gaussian of the DSM: weight of the original
-    a = clip((n - 1) / 2, 0, 1) (n = 1: smoothed, n = 2: half, n >= 3: untouched),
-    itself smoothed so that no edge appears where the pair count changes."""
+    a = 0.35 (n = 1), 0.675 (n = 2), 1 (n >= 3), itself smoothed (4 sigma) so that no edge
+    appears where the pair count changes. Full smoothing (a = 0, sigma 3) left visibly
+    blurred patches on the JJ-3 west edge."""
     m = np.isfinite(dsm)
     num = ndimage.gaussian_filter(np.where(m, dsm, 0).astype(np.float32), sigma)
     den = ndimage.gaussian_filter(m.astype(np.float32), sigma)
     sm = num / np.maximum(den, 1e-6)
-    a = np.clip((npr.astype(np.float32) - 1) / 2, 0, 1)
-    a = ndimage.gaussian_filter(a, 2 * sigma)
+    a = np.clip(LOWN_KEEP1 + (1 - LOWN_KEEP1) * (npr.astype(np.float32) - 1) / 2, 0, 1)
+    a = ndimage.gaussian_filter(a, 4 * sigma)
     return np.where(m, a * dsm + (1 - a) * sm, np.nan).astype(np.float32)
 
 

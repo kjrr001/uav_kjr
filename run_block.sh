@@ -3,6 +3,10 @@
 #
 #   ref      stereo + fuse with the ODM cameras    -> work/ref   (pair list, long-wave reference DSM)
 #   ties     sub-pixel ties on the original JPEGs  -> work/ties  (SIFT -> MAGSAC++ -> ALSC, GPU)
+#   tracks   (opt-in, STAGES must name it) multi-view tracks: keypoints linked over the pairs,
+#            every view re-measured by ALSC from one reference  -> work/tracks.npz
+#            JJ-3: 42 % of points in 3+ views (8 % before) but the same DSM (GCP 9.9 -> 9.7 cm,
+#            west-edge stripes unchanged), +20 min
 #   bba      own bundle adjustment + radial/grid image correction -> work/bba (+ work/bba/odm)
 #   undist   Lanczos undistortion with the new camera            -> work/images
 #   stereo   census-SGM per pair on the new images, search centred on the ODM DSM -> work/stereo/pairs
@@ -25,7 +29,7 @@ B="$1"; ODM=$(realpath "$2"); SRC=$(realpath "$3"); GCP=$(realpath "$4"); W="$5"
 HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/env.sh"
 SIGMA=${SIGMA:-30}; BBA_ITERS=${BBA_ITERS:-30}; TIE_WORKERS=${TIE_WORKERS:-2}
-STAGES=${STAGES:-"ref ties bba undist stereo fuse blend ortho products diag"}
+STAGES=${STAGES:-"ref ties bba undist stereo fuse blend ortho products diag"}   # + tracks (opt-in)
 mkdir -p "$W" "$OUT"; W=$(realpath "$W")
 LOG="$W/run_block.log"
 F='Warn|warn|census variant|exact streaming|FutureWarning|diags_array|warnings.warn|^Note: In Python'
@@ -56,11 +60,16 @@ fi
 if want ties; then
   N=$($PY -c "import json; print(len(json.load(open('$W/ref/stereo_meta.json'))['pairs']))")
   if [ "$(ls "$W/ties" 2>/dev/null | grep -c npz)" -lt "$N" ]; then
-    say "ties ($N pairs)"; run $PY "$K/ties.py" "$W/ref/stereo_meta.json" "$SRC" "$W" --workers "$TIE_WORKERS"
+    say "ties ($N pairs)"; run $PY "$K/ties.py" "$W/ref/stereo_meta.json" "$SRC" "$W" --workers "$TIE_WORKERS" --keep-sift
   fi
 fi
+if want tracks && [ ! -f "$W/tracks.npz" ]; then
+  say "tracks"; run $PY "$K/tracks.py" "$W/ref/stereo_meta.json" "$SRC" "$W"
+fi
+rm -rf "$W/sift"                              # SIFT cache (~80 MB per image), only ties/tracks use it
+TRK=(); [ -f "$W/tracks.npz" ] && TRK=(--tracks "$W/tracks.npz")
 if want bba && [ ! -f "$W/bba/bba.json" ]; then
-  say "bba ($BBA_ITERS iterations)"; run $PY "$K/bba.py" "$ODM" "$W/ties" "$GCP" "$W/bba" --iters "$BBA_ITERS"
+  say "bba ($BBA_ITERS iterations)"; run $PY "$K/bba.py" "$ODM" "$W/ties" "$GCP" "$W/bba" --iters "$BBA_ITERS" "${TRK[@]}"
   grep -E "^it |GCP . triangulated|grid correction" "$W/bba/bba.log" | tail -8 | tee -a "$LOG"
 fi
 if want undist; then
