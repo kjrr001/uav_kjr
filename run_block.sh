@@ -16,7 +16,7 @@
 # Env:   STAGES="ties bba ..." run only these (default: all, in order)
 #        REF_DSM=<tif>  use this as the long-wave reference instead of making ref/dsm_fused.tif
 #                       (recommended: <odm run>/odm_dem/dsm.tif; JJ-1 GCP RMS 8.3 vs 13.6 cm, 45 min less)
-#        SIGMA=30 (blend, m)  BBA_ITERS=30  TIE_WORKERS=3
+#        SIGMA=30 (blend, m)  BBA_ITERS=30  TIE_WORKERS=2
 # Every stage skips when its output already exists: rerun after a failure resumes;
 # delete a stage's output to redo it.
 set -euo pipefail
@@ -24,7 +24,7 @@ set -euo pipefail
 B="$1"; ODM=$(realpath "$2"); SRC=$(realpath "$3"); GCP=$(realpath "$4"); W="$5"; OUT="$6"
 HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/env.sh"
-SIGMA=${SIGMA:-30}; BBA_ITERS=${BBA_ITERS:-30}; TIE_WORKERS=${TIE_WORKERS:-3}
+SIGMA=${SIGMA:-30}; BBA_ITERS=${BBA_ITERS:-30}; TIE_WORKERS=${TIE_WORKERS:-2}
 STAGES=${STAGES:-"ref ties bba undist stereo fuse blend ortho products diag"}
 mkdir -p "$W" "$OUT"; W=$(realpath "$W")
 LOG="$W/run_block.log"

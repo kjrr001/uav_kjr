@@ -21,3 +21,11 @@ Manual (Korean): [MANUAL.md](MANUAL.md)
 | GCP height RMS | 3.8 cm | 5.2 cm |
 
 KJ-1 (DJI FC6310, 68 images, 5 GCPs).
+
+Speed (KJ-3, 61 images, 215 pairs, RTX 4060 8 GB): 1 h 47 min → 32 min per block, same result
+(GCP RMS 7.1 cm, ripple 0.51 cm). GPU guided SIFT matching, a C++/OpenMP point-elimination
+Schur kernel for the BBA (`kjr/csrc/schur.cpp`, built on first use), GPU fusion statistics,
+threaded stereo and ortho. Details in MANUAL.md §2.1.
+
+Deliverables: `tools/export_products.sh` (DSM, ortho, small hillshade / ortho, image
+footprint map per block, context map on a regional DEM).

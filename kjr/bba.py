@@ -111,6 +111,23 @@ class Model:
         return u0 + self.corr(u0, q)
 
 
+def load_schur():
+    """C++ point-elimination kernel (kjr/csrc/schur.cpp); None -> scipy sparse products."""
+    import ctypes
+    so = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_schur.so")
+    if not os.path.exists(so):
+        src = os.path.join(os.path.dirname(so), "csrc", "schur.cpp")
+        if os.system(f"g++ -O3 -march=native -fopenmp -shared -fPIC {src} -o {so}") != 0:
+            return None
+    lib = ctypes.CDLL(so)
+    P = np.ctypeslib.ndpointer
+    lib.schur_points.argtypes = [ctypes.c_int64, P(np.int64), ctypes.c_int, P(np.int64), P(np.float64),
+                                 P(np.float64), P(np.float64), ctypes.c_int64, P(np.float64), P(np.float64),
+                                 P(np.float64), P(np.float64), ctypes.c_int]
+    lib.schur_points.restype = ctypes.c_int
+    return lib
+
+
 def rot(rv):
     return Rotation.from_rotvec(rv).as_matrix()
 
@@ -193,6 +210,9 @@ def main():
     ap.add_argument("odm"); ap.add_argument("ties"); ap.add_argument("gcp"); ap.add_argument("out")
     ap.add_argument("--iters", type=int, default=12)
     ap.add_argument("--no-dr", action="store_true", help="brown only (no radial correction)")
+    ap.add_argument("--tol", type=float, default=1e-5, help="stop when the relative cost decrease is below this")
+    ap.add_argument("--sparse-schur", action="store_true",
+                    help="reference path: Schur complement with scipy sparse products (3-4x slower)")
     ap.add_argument("--free-intr", action="store_true",
                     help="also adjust f, cx, cy, k1-k3, p1, p2. Off by default: on KJ-1 (parallel nadir"
                          " strips, 5 GCPs) f and k1-k3 trade with block curvature -> a 1 m dome")
@@ -245,6 +265,11 @@ def main():
         npt = pt.max() + 1
         X = triangulate(R, t, model, ip, dr, cam, uv, pt, npt)
         say(f"dropped {len(badpt)} tie points with depth outside 0.5-2 x median ({zm:.0f} m)")
+
+    order = np.argsort(pt, kind="stable")          # observations grouped by point (Schur kernel)
+    cam, uv, pt = cam[order], uv[order], pt[order]
+    ptr = np.r_[0, np.cumsum(np.bincount(pt, minlength=npt))].astype(np.int64)
+    schur = None if args.sparse_schur else load_schur()
 
     # gauge / sanity: GCP reprojection with the ODM solution
     g_res = model.project(cam_xc(R, t, g_cam, g_X), ip, dr) - g_uv
@@ -299,23 +324,29 @@ def main():
         return ct + (r_g ** 2).sum() + (prior_terms(rv, t, dr) ** 2).sum()
 
     def jac(rv, t, ip, dr, X, cam_, uvX, fixedX, sig):
-        """numerical d(px)/d(params) for observations of cameras cam_ at points uvX.
-        returns base (n,2), Jc (n,2,6), Ji (n,2,8), Jd (n,2,2)+node index, Jx (n,2,3)"""
+        """d(px)/d(params) for observations of cameras cam_ at points uvX.
+        returns base (n,2), Jc (n,2,6), Ji (n,2,8), Jd (n,2,2)+node index, Jx (n,2,3).
+        Chain rule through Xc = R X + t: the projection is differentiated numerically in Xc only
+        (3 projections), then d/dt = dpx/dXc, d/dX = dpx/dXc R, d/drot = dpx/dXc dXc/drot.
+        Intrinsics are held (SIG_FIX) unless --free-intr: their columns are then not computed."""
         R = rot(rv)
-        base = model.project(cam_xc(R, t, cam_, uvX), ip, dr)
+        Xc = cam_xc(R, t, cam_, uvX)
+        base = model.project(Xc, ip, dr)
         n = len(cam_)
-        Jc = np.zeros((n, 2, 6)); Ji = np.zeros((n, 2, 8)); Jx = np.zeros((n, 2, 3))
+        Jxc = np.empty((n, 2, 3))
+        for j in range(3):
+            d = np.zeros(3); d[j] = 1e-4
+            Jxc[:, :, j] = (model.project(Xc + d, ip, dr) - base) / 1e-4
+        Jc = np.empty((n, 2, 6)); Ji = np.zeros((n, 2, 8))
         for j in range(3):
             h = 1e-7; d = np.zeros(3); d[j] = h
-            Rj = rot(rv + d)
-            Jc[:, :, j] = (model.project(cam_xc(Rj, t, cam_, uvX), ip, dr) - base) / h
-            Jc[:, :, 3 + j] = (model.project(cam_xc(R, t + d / h * 1e-4, cam_, uvX), ip, dr) - base) / 1e-4
-            if not fixedX:
-                Jx[:, :, j] = (model.project(cam_xc(R, t, cam_, uvX + d / h * 1e-4), ip, dr) - base) / 1e-4
-        Xc = cam_xc(R, t, cam_, uvX)
-        for j in range(8):
-            h = 1e-7; d = np.zeros(8); d[j] = h
-            Ji[:, :, j] = (model.project(Xc, ip + d, dr) - base) / h
+            Jc[:, :, j] = np.einsum("nck,nk->nc", Jxc, (cam_xc(rot(rv + d), t, cam_, uvX) - Xc) / h)
+        Jc[:, :, 3:] = Jxc
+        Jx = np.zeros((n, 2, 3)) if fixedX else np.einsum("nck,nkj->ncj", Jxc, R[cam_])
+        if args.free_intr:
+            for j in range(8):
+                h = 1e-7; d = np.zeros(8); d[j] = h
+                Ji[:, :, j] = (model.project(Xc, ip + d, dr) - base) / h
         i0, Jd = model.corr_terms(model.brown(Xc, ip))
         return base, Jc / sig, Ji / sig, Jd / sig, i0, Jx / sig
 
@@ -343,19 +374,40 @@ def main():
         r_t, r_g = residuals(rv, t, ip, dr, X)
         w_t, _ = robust_w(r_t, c)
         base, Jc, Ji, Jd, i0, Jx = jac(rv, t, ip, dr, X[pt], cam, X[pt], False, SIG_TIE)
-        Jg = sparse_global(cam, Jc, Ji, Jd, i0, w_t)
-        rt = (r_t * np.sqrt(w_t)[:, None]).ravel()
-        # points
-        Jxw = Jx * np.sqrt(w_t)[:, None, None]
-        rows = np.repeat(np.arange(2 * len(cam)), 3)
-        cols = (np.repeat(pt, 2)[:, None] * 3 + np.arange(3)).ravel()
-        Jp = sparse.csr_matrix((Jxw.reshape(-1), (rows, cols)), shape=(2 * len(cam), 3 * npt))
+        sw = np.sqrt(w_t)
+        rt = r_t * sw[:, None]
+        Jxw = Jx * sw[:, None, None]
         # GCP rows (fixed points)
         _, gc, gi, gd, g0, _ = jac(rv, t, ip, dr, g_X, g_cam, g_X, True, SIG_GCP)
         Jgcp = sparse_global(g_cam, gc, gi, gd, g0, np.ones(len(g_cam)))
-        # normal equations
-        U = (Jg.T @ Jg).toarray() + (Jgcp.T @ Jgcp).toarray()
-        bg = Jg.T @ rt + Jgcp.T @ r_g.ravel()
+        if schur is not None:
+            Gs = [Jc, Ji] + ([Jd] if ndr else [])
+            Gk = np.ascontiguousarray(np.concatenate(Gs, 2) * sw[:, None, None])          # (n, 2, K)
+            Ck = [cam[:, None] * 6 + np.arange(6),
+                  np.broadcast_to(o_int + np.arange(8) if args.free_intr else np.full(8, -1), (len(cam), 8))]
+            if ndr:
+                Ck.append(o_dr + i0)
+            Ck = np.ascontiguousarray(np.concatenate(Ck, 1), dtype=np.int64)
+            U = np.zeros((NG, NG)); bg = np.zeros(NG)
+            Vinv = np.empty((npt, 3, 3)); bp = np.empty((npt, 3))
+            nth = int(max(1, min(os.cpu_count(), 6e9 // (8 * NG * NG))))
+            if schur.schur_points(npt, ptr, Gk.shape[2], Ck, Gk, np.ascontiguousarray(Jxw), np.ascontiguousarray(rt),
+                                  NG, U, bg, Vinv, bp, nth) != 0:
+                raise MemoryError("schur_points: no memory for the thread copies")
+            U += (Jgcp.T @ Jgcp).toarray()
+            bg += Jgcp.T @ r_g.ravel()
+
+            def wt_dg(dg):        # W^T dg per point = sum_o P_o^T (G_o dg[cols_o])
+                q = np.einsum("nck,nk->nc", Gk, np.where(Ck >= 0, dg[Ck], 0))
+                out = np.zeros((npt, 3)); np.add.at(out, pt, np.einsum("nci,nc->ni", Jxw, q))
+                return out.ravel()
+        else:
+            Jg = sparse_global(cam, Jc, Ji, Jd, i0, w_t)
+            rows = np.repeat(np.arange(2 * len(cam)), 3)
+            cols = (np.repeat(pt, 2)[:, None] * 3 + np.arange(3)).ravel()
+            Jp = sparse.csr_matrix((Jxw.reshape(-1), (rows, cols)), shape=(2 * len(cam), 3 * npt))
+            U = (Jg.T @ Jg).toarray() + (Jgcp.T @ Jgcp).toarray()
+            bg = Jg.T @ rt.ravel() + Jgcp.T @ r_g.ravel()
         # priors (linear)
         pr = prior_terms(rv, t, dr)
         dpr = np.zeros(NG)
@@ -371,25 +423,31 @@ def main():
             U[o_dr:, o_dr:] += Pd
             dpr[o_dr:] = Pd @ dr
         bg = bg + dpr
-        # 3x3 blocks of Jp^T Jp and W = Jg^T Jp
-        Vb = np.zeros((npt, 3, 3))
-        np.add.at(Vb, pt, np.einsum("nki,nkj->nij", Jxw, Jxw))
-        Vb += 1e-6 * np.eye(3)
-        bp = np.zeros((npt, 3)); np.add.at(bp, pt, np.einsum("nki,nk->ni", Jxw, r_t * np.sqrt(w_t)[:, None]))
-        W = (Jg.T @ Jp).tocsr()                     # NG x 3npt
-        Vinv = np.linalg.inv(Vb)
-        bc = np.broadcast_to(np.arange(npt)[:, None, None] * 3 + np.arange(3)[None, None, :], (npt, 3, 3))
-        Vi = sparse.csr_matrix((Vinv.ravel(), (np.repeat(np.arange(3 * npt), 3), bc.ravel())),
-                               shape=(3 * npt, 3 * npt))
-        WVi = W @ Vi
-        Sm = U - (WVi @ W.T).toarray()
-        rhs = bg - WVi @ bp.ravel()
+        if schur is not None:
+            Sm, rhs = U, bg
+        else:
+            # 3x3 blocks of Jp^T Jp and W = Jg^T Jp
+            Vb = np.zeros((npt, 3, 3))
+            np.add.at(Vb, pt, np.einsum("nki,nkj->nij", Jxw, Jxw))
+            Vb += 1e-6 * np.eye(3)
+            bp = np.zeros((npt, 3)); np.add.at(bp, pt, np.einsum("nki,nk->ni", Jxw, rt))
+            W = (Jg.T @ Jp).tocsr()                     # NG x 3npt
+            Vinv = np.linalg.inv(Vb)
+            bc = np.broadcast_to(np.arange(npt)[:, None, None] * 3 + np.arange(3)[None, None, :], (npt, 3, 3))
+            Vi = sparse.csr_matrix((Vinv.ravel(), (np.repeat(np.arange(3 * npt), 3), bc.ravel())),
+                                   shape=(3 * npt, 3 * npt))
+            WVi = W @ Vi
+            Sm = U - (WVi @ W.T).toarray()
+            rhs = bg - WVi @ bp.ravel()
+
+            def wt_dg(dg):
+                return W.T @ dg
         ok = False
         c0 = cost(rv, t, ip, dr, X, c)
         for _ in range(8):
             A = Sm + lam * np.diag(np.maximum(np.diag(Sm), 1e-9))
             dg = -np.linalg.solve(A, rhs)
-            dp = -(Vinv @ (bp + (W.T @ dg).reshape(npt, 3))[..., None])[..., 0]
+            dp = -(Vinv @ (bp + wt_dg(dg).reshape(npt, 3))[..., None])[..., 0]
             nrv = rv + dg[:6 * nc].reshape(nc, 6)[:, :3]
             nt = t + dg[:6 * nc].reshape(nc, 6)[:, 3:]
             nip = ip + dg[o_int:o_int + 8]
@@ -406,7 +464,7 @@ def main():
         say(f"it {it}: cost {c0:.4g} -> {c1:.4g} lam {lam:.1e} tie |res| median {np.median(e):.3f} px "
             f"p90 {np.percentile(e, 90):.3f} GCP RMS {np.sqrt((r_g ** 2).sum(1).mean()) * SIG_GCP:.2f} px "
             f"f {ip[0]:.6f} dr max {np.abs(dr).max():.3f} px  {time.time() - tic:.0f}s")
-        if not ok or abs(c0 - c1) / c0 < 1e-5:
+        if not ok or abs(c0 - c1) / c0 < args.tol:
             break
 
     # ---------------- report

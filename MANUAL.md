@@ -31,20 +31,34 @@ ODM으로 처리한 드론 블록에서 DSM과 정사영상을 다시 만드는 
 
 `run_block.sh` 하나가 아래 단계를 순서대로 실행한다. 단계마다 결과가 이미 있으면 건너뛴다. 그래서 중간에 실패해도 다시 실행하면 이어서 진행한다.
 
-| 단계 | 하는 일 | 결과 (`<work>/`) | KJ-1 소요 (RTX 4060 8 GB) |
+| 단계 | 하는 일 | 결과 (`<work>/`) | KJ-3 소요 (RTX 4060 8 GB, 16코어), 최적화 전 → 후 |
 |---|---|---|---|
-| `ref` | ODM 카메라로 stereo + 융합 → 사진 쌍 목록, 긴 파장 참조 DSM | `ref/stereo_meta.json`, `ref/dsm_fused.tif` | 약 45분 |
-| `ties` | 원본 JPEG에서 tie point 추출 (GPU ALSC) | `ties/<a>__<b>.npz` | 약 50분 (242쌍) |
-| `bba` | 번들 조정 (LM + Schur 소거, Cauchy 가중) | `bba/bba.json`, `bba/bba.log`, `bba/odm/` | 약 25분 (30회 반복) |
-| `undist` | 새 카메라로 Lanczos 왜곡 보정 | `images/*.JPG.tif` | 약 1분 |
-| `stereo` | 사진 쌍별 census-SGM (pfsgbm, MGM, CUDA). 탐색 중심은 ODM DSM | `stereo/pairs/*.npz` | 약 25분 |
-| `fuse` | 강건 융합 (중앙값 + NMAD, 가장자리·외곽 가중) | `stereo/dsm_fused.tif` | 약 20분 |
-| `blend` | 긴 파장(σ 30 m)은 `ref`, 세부는 `stereo` | `final/dsm_fused.tif` | 1분 |
-| `ortho` | 최종 DSM으로 정사영상 (가장 수직에 가까운 사진에 가중) | `final/ortho.tif` | 약 5분 |
-| `products` | COG, ENVI, JPG 제품 파일 | `<products>/` | 약 3분 |
-| `diag` | 컬러 힐쉐이드, GCP 높이, 사진 좌표 무늬 검사 | `diag/`, 로그 | 약 2분 |
+| `ref` | ODM 카메라로 stereo + 융합 → 사진 쌍 목록, 긴 파장 참조 DSM. `REF_DSM`을 주면 사진 쌍 목록만 | `ref/stereo_meta.json`, `ref/dsm_fused.tif` | 약 45분 → 약 15분 (`REF_DSM`이면 수 초) |
+| `ties` | 원본 JPEG에서 tie point 추출: 사진별 SIFT 1회 → GPU 유도 정합 → MAGSAC++ → GPU ALSC | `ties/<a>__<b>.npz` | 39분 → **8분** (215쌍) |
+| `bba` | 번들 조정 (LM, 점 소거 Schur는 C++/OpenMP 커널, Cauchy 가중) | `bba/bba.json`, `bba/bba.log`, `bba/odm/` | 22분 → **5분** |
+| `undist` | 새 카메라로 Lanczos 왜곡 보정 | `images/*.JPG.tif` | 1분 |
+| `stereo` | 사진 쌍별 census-SGM (fsgbm, MGM, CUDA). 탐색 중심은 ODM DSM. CPU 작업은 스레드로 GPU 정합과 겹친다 | `stereo/pairs/*.npz` | 21분 → **12분** (GPU 정합 시간 그대로) |
+| `fuse` | 강건 융합 (중앙값 + NMAD, 가장자리·외곽 가중). 셀별 통계는 GPU | `stereo/dsm_fused.tif` | 17분 → **1분** |
+| `blend` | 긴 파장(σ 30 m)은 `ref`, 세부는 `stereo` | `final/dsm_fused.tif` | 수 초 |
+| `ortho` | 최종 DSM으로 정사영상 (가장 수직에 가까운 사진에 가중), 타일 병렬 | `final/ortho.tif` | 4분 → **2분** |
+| `products` | COG, ENVI, JPG 제품 파일 | `<products>/` | 약 2.5분 (디스크 쓰기) |
+| `diag` | 컬러 힐쉐이드, GCP 높이, 사진 좌표 무늬 검사 | `diag/`, 로그 | 수십 초 |
 
-블록 하나에 모두 **약 3시간** 걸린다. 디스크는 작업 폴더에 약 10 GB, 제품 파일에 약 11 GB가 든다.
+블록 하나(`REF_DSM` 사용)에 KJ-3 기준 **약 1시간 47분 → 32분** 걸린다. 결과 품질은 같다 (KJ-3 GCP 높이 RMS 7.1 → 7.1 cm, 사진 좌표 무늬 0.51 cm / 상관 0.27 → 같음). JJ-3처럼 사진 쌍이 많은 블록(961쌍)은 stereo가 약 45분으로 가장 길다.
+디스크는 작업 폴더에 약 10 GB(+ tie 단계 동안 SIFT 캐시 사진당 약 80 MB, 끝나면 지움), 제품 파일에 약 11 GB가 든다.
+
+### 2.1 속도 최적화 기록 (2026-10-26)
+
+| 단계 | 병목 (프로파일) | 바꾼 것 | 결과 동일성 |
+|---|---|---|---|
+| `fuse` | 셀별 `np.sort` 76 %, 7×7 중앙값 필터·FillNodata를 두 번 계산 | 사진 쌍 전처리 병렬 1회 + 캐시, 중앙값/MAD/가중평균을 GPU(torch), 7×7 중앙값 GPU, 마무리 1회, 형태 연산을 cv2·레이블링으로 | 최대 차이 0.003 mm |
+| `bba` | scipy 희소 행렬 곱으로 Schur 보완 (반복당 58초 중 40초), 수치 미분 17회 투영 | `kjr/csrc/schur.cpp`: 점마다 Schur 보완을 직접 누적 (Ceres 방식, OpenMP), 연쇄 법칙 미분 (투영 3회), 고정된 내부 파라미터 열 생략 | 카메라 위치 차이 0.2 mm |
+| `ties` | FLANN 근사 최근접 (사진 쌍당 21–29초, 77 %), 사진마다 SIFT 반복 | 사진별 SIFT 캐시, 강한 8000점(안 되면 30000점)으로 호모그래피 → 8×6 타일별 예측 위치 ±120 px 안에서 GPU 정확 2-NN | tie 수 약 1.8배, 최종 DSM 차이 NMAD 0.44 cm |
+| `stereo` | CPU 준비/삼각측량이 GPU 정합과 직렬 | 사진 쌍 3개를 스레드로, GPU 정합만 잠금으로 하나씩, 회색조 영상 캐시 | 비트 단위 동일 |
+| `ortho` | 타일 직렬 | 타일 스레드 병렬 | 비트 단위 동일 |
+
+번들 조정을 일찍 멈추는 것(상대 비용 변화 3e-4)도 시험했으나 카메라 위치가 1.3 cm, 보정 격자가 0.2 px 달라져서 쓰지 않는다 (`--tol` 기본 1e-5 유지).
+이전 방식은 옵션으로 남겼다: `bba.py --sparse-schur`, `ties.py --flann`, `fuse.py --cpu`.
 
 ---
 
@@ -55,6 +69,7 @@ ODM으로 처리한 드론 블록에서 DSM과 정사영상을 다시 만드는 
 - Python 환경 (conda prefix): numpy, scipy, opencv, gdal, matplotlib, pillow, torch, cuda-python
 - UAV 정합 라이브러리 `UAV_LIB`: `tiepoints`(SIFT + MAGSAC++ + ALSC)와 `matcher`(census SGM). 현재 위치는 `/work10/planet_stereo/UAV`이다.
 - GDAL 명령행 도구: `gdal_translate`, `gdalwarp`, `gdaldem`
+- `g++` (OpenMP): 번들 조정의 C++ 커널 `kjr/csrc/schur.cpp`를 처음 실행할 때 `kjr/_schur.so`로 자동 컴파일한다. 직접 하려면 `cd kjr/csrc && g++ -O3 -march=native -fopenmp -shared -fPIC schur.cpp -o ../_schur.so`. 컴파일이 안 되면 scipy 방식으로 돌아간다 (3–4배 느림).
 - 끝난 ODM GCP 처리 폴더. 다음 파일이 있어야 한다:
   - `opensfm/reconstruction.json`
   - `opensfm/undistorted/reconstruction.json` 및 `opensfm/undistorted/images/`
@@ -108,7 +123,7 @@ REF_DSM=/work/eridu_drone/odm_data/KJ1_gcp/odm_dem/dsm.tif ./run_block.sh KJ1 ..
 | `REF_DSM` | (없음) | 긴 파장 참조 DSM을 직접 지정한다. **권장값: ODM 자체 DSM (`<ODM 처리 폴더>/odm_dem/dsm.tif`).** 그러면 `ref` 단계는 사진 쌍 목록만 만들고 약 45분을 아낀다. JJ-1에서 GCP 높이 RMS는 ODM 카메라로 만든 참조를 쓸 때 13.6 cm, ODM DSM을 쓸 때 8.3 cm였고, 무늬 제거 효과는 같았다 (0.46/0.18 → 0.47/0.19). |
 | `SIGMA` | 30 | `blend`의 Gaussian σ (m) |
 | `BBA_ITERS` | 30 | 번들 조정 반복 횟수 |
-| `TIE_WORKERS` | 3 | tie point 병렬 작업 수. GPU 메모리가 모자라면 자동으로 재시도한다. |
+| `TIE_WORKERS` | 2 | tie point 사진 쌍 병렬 작업 수(GPU 공유). GPU 메모리가 모자라면 자동으로 재시도한다. |
 
 ### 다시 돌리기
 
@@ -133,6 +148,14 @@ REF_DSM=/work/eridu_drone/odm_data/KJ1_gcp/odm_dem/dsm.tif ./run_block.sh KJ1 ..
 | `B_kjr_dsm_color_hillshade_small.jpg` | 높이 5배 과장 컬러 힐쉐이드 (0.76 m) |
 
 `<작업 폴더>/final/dsm_fused.tif`는 DSM 원본 격자(정사영상 픽셀의 2배, KJ-1은 13 cm)이다.
+
+### 5.1 전달용 폴더 만들기
+
+```bash
+tools/export_products.sh <products 루트> <작업 루트> <전달 폴더> <지역 DEM.tif> JJ1 JJ2 JJ3 KJ1 KJ2 KJ3
+```
+
+블록마다 `<B>_kjr_dsm.tif`, `<B>_kjr_ortho.tif`, `<B>_kjr_dsm_color_hillshade_small.jpg`, `<B>_kjr_ortho_small.jpg`(힐쉐이드와 같은 크기), `<B>_image_footprints.png`(작은 정사영상 위에 블록 경계와 사진별 지상 촬영 범위)를 복사·생성하고, 전달 폴더에 `uav_context_map.png`(지역 DEM 컬러 힐쉐이드 위에 블록 경계와 이름, 경위도 축; 왼쪽 전체, 오른쪽 확대)를 만든다.
 
 ---
 

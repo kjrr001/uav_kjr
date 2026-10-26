@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 import cv2
@@ -100,6 +101,22 @@ class PriorSurface:
 
 
 RECT_INTERP = cv2.INTER_LINEAR   # rectification resampling
+GPU_LOCK = threading.Lock()      # pairs run in threads; only the matcher is serialised on the GPU
+_GREY = {}                        # name -> corner-cut grey image (each image is in ~8 pairs)
+_GREY_LOCK = threading.Lock()
+GREY_CACHE = 16
+
+
+def grey_cut(run, name, cam):
+    with _GREY_LOCK:
+        img = _GREY.get(name)
+    if img is None:
+        img = cut_corners(run.load_grey(name), cam)
+        with _GREY_LOCK:
+            _GREY[name] = img
+            while len(_GREY) > GREY_CACHE:
+                _GREY.pop(next(iter(_GREY)))
+    return img
 PRIOR_ROUND = False              # round the plane-prior shift to whole pixels
 
 
@@ -139,8 +156,8 @@ def process_pair(run, a, b, plane, grid, matcher_kw, level=1, verbose=True, prio
                                    borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
 
     t0 = time.time()
-    L = warp(ca, Kr_a, cut_corners(run.load_grey(a), ca))
-    Rimg = warp(cb, Kr_b, cut_corners(run.load_grey(b), cb))
+    L = warp(ca, Kr_a, grey_cut(run, a, ca))
+    Rimg = warp(cb, Kr_b, grey_cut(run, b, cb))
 
     # prior disparity from the plane: left canvas pixel -> plane -> right canvas column
     rows, cols = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -175,7 +192,10 @@ def process_pair(run, a, b, plane, grid, matcher_kw, level=1, verbose=True, prio
     srch, wsz = kw.pop("search_range"), kw.pop("window_size")
     Lf = np.where(np.isfinite(L), L, np.nanmean(L)).astype(np.float32)
     Rf = np.where(np.isfinite(Rw), Rw, np.nanmean(Rw)).astype(np.float32)
-    ddx, _, score, ok = fsgbm.fsgbm_match(Lf, Rf, srch, wsz, **kw)
+    with GPU_LOCK:
+        tg = time.time()
+        ddx, _, score, ok = fsgbm.fsgbm_match(Lf, Rf, srch, wsz, **kw)
+        tg = time.time() - tg
     del Lf, Rf
     # census window + cost box reach ~12 px: pixels that close to either image's
     # border matched against the mean fill, not image (seen as edge spikes)
@@ -213,7 +233,7 @@ def process_pair(run, a, b, plane, grid, matcher_kw, level=1, verbose=True, prio
     sz = np.bincount(lin, z, h * w)
     zz = np.where(n > 0, sz / np.maximum(n, 1), np.nan).reshape(h, w).astype(np.float32)
     rr = np.where(n > 0, np.bincount(lin, rad, h * w) / np.maximum(n, 1), np.nan).reshape(h, w).astype(np.float16)
-    info = dict(canvas=(W, H), valid=float(ok.mean()), match_s=t1 - t0, B=B,
+    info = dict(canvas=(W, H), valid=float(ok.mean()), match_s=t1 - t0, gpu_s=tg, B=B,
                 z_med=float(np.nanmedian(zz)))
     if verbose:
         print(f"  {a} {b}: canvas {W}x{H}, valid {ok.mean()*100:.1f}%, B {B:.0f} m, "
@@ -239,6 +259,7 @@ def main():
     ap.add_argument("--max-pairs", type=int, default=0)
     ap.add_argument("--min-overlap", type=float, default=0.08)
     ap.add_argument("--img-dir", default=None, help="own undistorted images (kjr/undistort.py, Lanczos)")
+    ap.add_argument("--threads", type=int, default=3, help="pairs in flight (the GPU matcher runs one at a time)")
     ap.add_argument("--meta-only", action="store_true", help="write stereo_meta.json (grid, pairs) and stop")
     ap.add_argument("--prior-dsm", default=os.environ.get("REF_DSM") or None,
                     help="DSM that centres the disparity search (default: $REF_DSM, else <run>/odm_dem/dsm.tif,"
@@ -272,17 +293,24 @@ def main():
     if args.meta_only:
         return
     log = open(os.path.join(args.out, "pairs.log"), "a")
-    for k, (a, b, ov, B) in enumerate(pairs):
-        fn = os.path.join(args.out, "pairs", f"{a}__{b}.npz")
-        if os.path.exists(fn):
-            continue
+    todo = [(k, p) for k, p in enumerate(pairs)
+            if not os.path.exists(os.path.join(args.out, "pairs", f"{p[0]}__{p[1]}.npz"))]
+    # threads: image loading, rectification and triangulation of other pairs overlap the
+    # GPU matching of one (GPU_LOCK); each pair is computed exactly as before
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(kp):
+        k, (a, b, ov, B) = kp
         print(f"[{k+1}/{len(pairs)}] overlap {ov:.2f}", flush=True)
-        res = process_pair(run, a, b, plane, grid, MATCHER, args.level, prior=prior)
-        if res is None:
-            continue
-        arrs, info = res
-        np.savez_compressed(fn, **arrs)
-        log.write(json.dumps(dict(a=a, b=b, overlap=ov, **info)) + "\n"); log.flush()
+        return a, b, ov, process_pair(run, a, b, plane, grid, MATCHER, args.level, prior=prior)
+
+    with ThreadPoolExecutor(args.threads) as ex:
+        for a, b, ov, res in ex.map(one, todo):
+            if res is None:
+                continue
+            arrs, info = res
+            np.savez_compressed(os.path.join(args.out, "pairs", f"{a}__{b}.npz"), **arrs)
+            log.write(json.dumps(dict(a=a, b=b, overlap=ov, **info)) + "\n"); log.flush()
 
 
 if __name__ == "__main__":
