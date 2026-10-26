@@ -54,6 +54,7 @@ SIG_T = 1.0            # m
 SIG_DR = 1.0           # px, dr prior to 0
 SIG_DR2 = 0.1          # px, dr second difference
 SIG_FIX = 1e-9         # intrinsics held at the ODM values (unless --free-intr)
+MAX_OBS = 4_000_000    # tie observations kept; JJ-3 (FC9313, 17 M) ran out of 30 GB. KJ/JJ1/JJ2 are below it
 SIG_ORTH = 1e-4        # px: dr is kept orthogonal to 1, r, r^3, r^5, r^7 - the smooth radial
                        # part belongs to f, k1..k3 (otherwise they trade, dr -> several px)
 INTR = ["focal_x", "c_x", "c_y", "k1", "k2", "k3", "p1", "p2"]
@@ -145,18 +146,31 @@ def triangulate(R, t, model, ip, dr, cam, uv, pt, npt):
     return np.linalg.solve(A, b[..., None])[..., 0]
 
 
-def load_ties(tie_dir, names):
-    """multi-view tracks: anchor = (first image, exact SIFT position)."""
+def load_ties(tie_dir, names, max_obs=MAX_OBS):
+    """multi-view tracks: anchor = (first image, exact SIFT position).
+    Above max_obs, anchors are thinned by a hash of their position: the same anchor is kept
+    or dropped in every pair, so multi-view tracks stay whole."""
     idx = {n: k for k, n in enumerate(names)}
+    files = [f for f in sorted(glob.glob(os.path.join(tie_dir, "*.npz")))]
+    nobs = 0
+    for fn in files:
+        with np.load(fn) as d:
+            n = len(d["pa"])
+        nobs += 2 * n if n >= 30 else 0
+    frac = min(1.0, max_obs / max(nobs, 1))
     obs_cam, obs_uv, obs_pt = [], [], []
     anchors = {}
     npt = 0
-    for fn in sorted(glob.glob(os.path.join(tie_dir, "*.npz"))):
+    for fn in files:
         a, b = os.path.basename(fn)[:-4].split("__")
         with np.load(fn) as d:
             pa, pb = d["pa"], d["pb"]
         if len(pa) < 30:
             continue
+        if frac < 1:
+            h = np.sin(pa[:, 0] * 12.9898 + pa[:, 1] * 78.233) * 43758.5453
+            sel = (h - np.floor(h)) < frac
+            pa, pb = pa[sel], pb[sel]
         ia, ib = idx[a], idx[b]
         tab = anchors.setdefault(ia, {})
         for p, q in zip(map(tuple, pa), pb):
@@ -219,6 +233,18 @@ def main():
     rv, t, ip = rv0.copy(), t0.copy(), ip0.copy()
     R = rot(rv)
     X = triangulate(R, t, model, ip, dr, cam, uv, pt, npt)
+    # wrong matches with near-parallel rays triangulate behind a camera or km away; their
+    # projection is NaN/inf and stops the adjustment (JJ-3: 351 of 17 M observations)
+    zc = cam_xc(R, t, cam, X[pt])[:, 2]
+    zm = np.median(zc)
+    badpt = np.unique(pt[(zc < 0.5 * zm) | (zc > 2.0 * zm)])
+    if len(badpt):
+        keep = ~np.isin(pt, badpt)
+        cam, uv = cam[keep], uv[keep]
+        _, pt = np.unique(pt[keep], return_inverse=True)
+        npt = pt.max() + 1
+        X = triangulate(R, t, model, ip, dr, cam, uv, pt, npt)
+        say(f"dropped {len(badpt)} tie points with depth outside 0.5-2 x median ({zm:.0f} m)")
 
     # gauge / sanity: GCP reprojection with the ODM solution
     g_res = model.project(cam_xc(R, t, g_cam, g_X), ip, dr) - g_uv
