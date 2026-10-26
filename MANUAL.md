@@ -37,14 +37,14 @@ ODM으로 처리한 드론 블록에서 DSM과 정사영상을 다시 만드는 
 | `ties` | 원본 JPEG에서 tie point 추출: 사진별 SIFT 1회 → GPU 유도 정합 → MAGSAC++ → GPU ALSC | `ties/<a>__<b>.npz` | 39분 → **8분** (215쌍) |
 | `bba` | 번들 조정 (LM, 점 소거 Schur는 C++/OpenMP 커널, Cauchy 가중) | `bba/bba.json`, `bba/bba.log`, `bba/odm/` | 22분 → **5분** |
 | `undist` | 새 카메라로 Lanczos 왜곡 보정 | `images/*.JPG.tif` | 1분 |
-| `stereo` | 사진 쌍별 census-SGM (fsgbm, MGM, CUDA). 탐색 중심은 ODM DSM. CPU 작업은 스레드로 GPU 정합과 겹친다 | `stereo/pairs/*.npz` | 21분 → **12분** (GPU 정합 시간 그대로) |
+| `stereo` | 사진 쌍별 census-SGM (fsgbm, MGM, CUDA). 탐색 중심은 ODM DSM. CPU 작업은 스레드로 GPU 정합과 겹친다. 서브픽셀 커널과 SGM 실행 루프는 자체 구현(`kjr/fastmatch.py`) | `stereo/pairs/*.npz` | 21분 → 12분 → **6.7분** |
 | `fuse` | 강건 융합 (중앙값 + NMAD, 가장자리·외곽 가중). 셀별 통계는 GPU | `stereo/dsm_fused.tif` | 17분 → **1분** |
 | `blend` | 긴 파장(σ 30 m)은 `ref`, 세부는 `stereo` | `final/dsm_fused.tif` | 수 초 |
 | `ortho` | 최종 DSM으로 정사영상 (가장 수직에 가까운 사진에 가중), 타일 병렬 | `final/ortho.tif` | 4분 → **2분** |
 | `products` | COG, ENVI, JPG 제품 파일 | `<products>/` | 약 2.5분 (디스크 쓰기) |
 | `diag` | 컬러 힐쉐이드, GCP 높이, 사진 좌표 무늬 검사 | `diag/`, 로그 | 수십 초 |
 
-블록 하나(`REF_DSM` 사용)에 KJ-3 기준 **약 1시간 47분 → 32분** 걸린다. 결과 품질은 같다 (KJ-3 GCP 높이 RMS 7.1 → 7.1 cm, 사진 좌표 무늬 0.51 cm / 상관 0.27 → 같음). JJ-3처럼 사진 쌍이 많은 블록(961쌍)은 stereo가 약 45분으로 가장 길다.
+블록 하나(`REF_DSM` 사용)에 KJ-3 기준 **약 1시간 47분 → 32분 → 약 27분** 걸린다. 결과 품질은 같다 (KJ-3 GCP 높이 RMS 7.1 → 7.1 cm, 사진 좌표 무늬 0.51 cm / 상관 0.27 → 같음). JJ-3처럼 사진 쌍이 많은 블록(961쌍)은 stereo가 가장 길다 (약 45분 → 약 25분 예상).
 디스크는 작업 폴더에 약 10 GB(+ tie 단계 동안 SIFT 캐시 사진당 약 80 MB, 끝나면 지움), 제품 파일에 약 11 GB가 든다.
 
 ### 2.1 속도 최적화 기록 (2026-10-26)
@@ -56,9 +56,13 @@ ODM으로 처리한 드론 블록에서 DSM과 정사영상을 다시 만드는 
 | `ties` | FLANN 근사 최근접 (사진 쌍당 21–29초, 77 %), 사진마다 SIFT 반복 | 사진별 SIFT 캐시, 강한 8000점(안 되면 30000점)으로 호모그래피 → 8×6 타일별 예측 위치 ±120 px 안에서 GPU 정확 2-NN | tie 수 약 1.8배, 최종 DSM 차이 NMAD 0.44 cm |
 | `stereo` | CPU 준비/삼각측량이 GPU 정합과 직렬 | 사진 쌍 3개를 스레드로, GPU 정합만 잠금으로 하나씩, 회색조 영상 캐시 | 비트 단위 동일 |
 | `ortho` | 타일 직렬 | 타일 스레드 병렬 | 비트 단위 동일 |
+| `stereo` (2차) | GPU 정합 쌍당 3.9초 중 서브픽셀 보정 커널이 GPU 시간의 79 % (점마다 쌍선형 보간 7,200회, 시그모이드 13,000회), SGM이 작은 커널 67,890회를 파이썬에서 실행 (실행 오버헤드 > GPU 일) | `kjr/fastmatch.py`: 왼쪽 descriptor는 변위와 무관 → 화소당 1회 계산한 16장 지도; G/H를 안 쓰는 평가는 ±h 샘플 생략; 정수 행이라 쌍선형의 아래 행 생략; 배열 없이 바로 누적 (레지스터 124 → 48개). SGM 단계 루프를 C++(`kjr/csrc/sgmloop.cpp`)로 | 같은 IEEE 연산·순서, 쌍 단독 실행에서 비트 단위 동일 (쌍당 3.9 → 2.1초) |
 
 번들 조정을 일찍 멈추는 것(상대 비용 변화 3e-4)도 시험했으나 카메라 위치가 1.3 cm, 보정 격자가 0.2 px 달라져서 쓰지 않는다 (`--tol` 기본 1e-5 유지).
-이전 방식은 옵션으로 남겼다: `bba.py --sparse-schur`, `ties.py --flann`, `fuse.py --cpu`.
+이전 방식은 옵션으로 남겼다: `bba.py --sparse-schur`, `ties.py --flann`, `fuse.py --cpu`, `stereo.py --uav-kernels`.
+빠른 수학 함수(`__expf`, `__fdividef`)로 서브픽셀을 0.3초 더 줄일 수 있지만 결과가 비트 단위로 같지 않아 쓰지 않는다.
+
+주의 (원래부터 있던 비결정성): fsgbm은 실행 순간의 GPU 여유 메모리로 띠(band) 크기를 정한다. 그래서 같은 쌍이라도 다른 쌍과 함께 돌 때와 혼자 돌 때 띠 경계가 달라지고, 몇 개 쌍(KJ-3 215쌍 중 3개)에서 일부 셀이 최대 15 cm 다를 수 있다. 융합의 중앙값이 이를 흡수한다.
 
 ---
 

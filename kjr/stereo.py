@@ -260,11 +260,17 @@ def main():
     ap.add_argument("--min-overlap", type=float, default=0.08)
     ap.add_argument("--img-dir", default=None, help="own undistorted images (kjr/undistort.py, Lanczos)")
     ap.add_argument("--threads", type=int, default=3, help="pairs in flight (the GPU matcher runs one at a time)")
+    ap.add_argument("--uav-kernels", action="store_true",
+                    help="the UAV library's own sub-pixel kernel and python SGM step loop (kjr/fastmatch.py"
+                         " replaces them with bit-identical, ~1.8x faster ones)")
     ap.add_argument("--meta-only", action="store_true", help="write stereo_meta.json (grid, pairs) and stop")
     ap.add_argument("--prior-dsm", default=os.environ.get("REF_DSM") or None,
                     help="DSM that centres the disparity search (default: $REF_DSM, else <run>/odm_dem/dsm.tif,"
                          " else the SfM ground plane)")
     args = ap.parse_args()
+    if not args.uav_kernels:
+        from kjr import fastmatch
+        fastmatch.install(); fastmatch.install_sgm()
 
     run = Run(args.run)
     run.img_dir = args.img_dir
