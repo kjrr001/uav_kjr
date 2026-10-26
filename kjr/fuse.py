@@ -243,7 +243,26 @@ def median7(a, rows=256):
     return out
 
 
-def finish(dsm, sigmas, npr):
+LOWN_SIGMA = 3.0      # cells: Gaussian for cells seen by 1 pair (2 pairs: half of it blended)
+LOWN_SPIKE = 0.12     # m: spike threshold there (0.25 elsewhere)
+
+
+def lown_smooth(dsm, npr, sigma=LOWN_SIGMA):
+    """Cells with 1-2 pairs carry ~2x the fine noise of the rest (high-pass p95 14-17 vs
+    5-6 cm, JJ-1 / JJ-2 / KJ-3): no outlier test is possible with one or two values. They
+    are blended towards a NaN-aware Gaussian of the DSM: weight of the original
+    a = clip((n - 1) / 2, 0, 1) (n = 1: smoothed, n = 2: half, n >= 3: untouched),
+    itself smoothed so that no edge appears where the pair count changes."""
+    m = np.isfinite(dsm)
+    num = ndimage.gaussian_filter(np.where(m, dsm, 0).astype(np.float32), sigma)
+    den = ndimage.gaussian_filter(m.astype(np.float32), sigma)
+    sm = num / np.maximum(den, 1e-6)
+    a = np.clip((npr.astype(np.float32) - 1) / 2, 0, 1)
+    a = ndimage.gaussian_filter(a, 2 * sigma)
+    return np.where(m, a * dsm + (1 - a) * sm, np.nan).astype(np.float32)
+
+
+def finish(dsm, sigmas, npr, lown=True):
     """spike removal + hole filling once; returns [(out, sigma) for each sigma], cov, spikes."""
     # coverage from where pairs contributed (geometry), not from surviving data:
     # noisy single-pair areas must not make a ragged edge
@@ -251,9 +270,12 @@ def finish(dsm, sigmas, npr):
     cov = opening(cov, 10)
     fin = np.isfinite(dsm)
     med7 = median7(np.where(fin, dsm, np.nanmedian(dsm)).astype(np.float32))
-    spike = fin & (np.abs(dsm - med7) > 0.25)
+    thr = np.where(npr <= 2, LOWN_SPIKE, 0.25) if lown else 0.25
+    spike = fin & (np.abs(dsm - med7) > thr)
     del med7
     dsm = dsm.copy(); dsm[spike] = np.nan
+    if lown:
+        dsm = lown_smooth(dsm, npr)
     H, W = dsm.shape
     mem = gdal.GetDriverByName("MEM").Create("", W, H, 1, gdal.GDT_Float32)
     b = mem.GetRasterBand(1); b.SetNoDataValue(-9999)
@@ -285,6 +307,8 @@ def main():
                     help="final Gaussian, cells (1.5 = ~20 cm: looks like ODM ultra, keeps tracks/ditches)")
     ap.add_argument("--workers", type=int, default=12, help="processes preparing the pair rasters")
     ap.add_argument("--cpu", action="store_true", help="old single-process CPU fusion (reference)")
+    ap.add_argument("--no-lown", action="store_true",
+                    help="no extra smoothing / spike test where only 1-2 pairs see a cell (lown_smooth)")
     args = ap.parse_args()
     out = args.out
     meta = json.load(open(os.path.join(out, "stereo_meta.json")))
@@ -319,7 +343,7 @@ def main():
               f"tilt p90 {np.percentile(np.hypot(P[:, 1], P[:, 2]) / g['cell'], 90):.2f} m/km", flush=True)
     json.dump(planes, open(os.path.join(out, "pair_planes.json"), "w"), indent=0)
 
-    (raw, dsm), cov, nsp = finish(dsm, (0, args.sigma), npr)
+    (raw, dsm), cov, nsp = finish(dsm, (0, args.sigma), npr, lown=not args.no_lown)
     write_tif(os.path.join(out, "dsm_raw.tif"), raw, g)
     print(f"coverage {cov.sum() * g['cell']**2 / 1e6:.3f} km2, spikes removed {nsp}", flush=True)
     write_tif(os.path.join(out, "dsm_fused.tif"), dsm, g)
