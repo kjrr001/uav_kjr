@@ -1,4 +1,6 @@
-# ODM-KJR 매뉴얼
+# ODM-KJR 매뉴얼 (기술 문서)
+
+> **사용법만 필요하면 [`manual/README.md`](manual/README.md)** (사용자 매뉴얼, 표준 컨트롤 파일·실행 템플릿은 `manual/templates/`).
 
 드론 사진과 GCP 목록으로 DSM과 정사영상을 만드는 도구다. **ODM은 필요 없다.** 실행은 컨트롤 파일(`*.cfg`)과 `kjr_run`으로 한다 (§4).
 사진 위치·자세와 카메라 값(SfM)은 원본 OpenSfM(BSD)으로 구하고(§4.1), 다음 세 단계를 자체 코드로 한다.

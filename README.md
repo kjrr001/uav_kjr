@@ -28,7 +28,8 @@ resolved values, the git state and a copy of the code it ran in `<WORK_DIR>/job/
 JJ-3 (117 images, 5 GCPs): OpenSfM 11 min, the BBA lands where it did from ODM (GCP residuals
 within 4 cm), final DSM GCP height RMS 5.3 cm (9.9 cm from ODM).
 
-Manual (Korean): [MANUAL.md](MANUAL.md)
+User manual (Korean) with the standard templates: [manual/](manual/README.md)
+(`manual/templates/new_block.sh` starts a new block). Technical manual (Korean): [MANUAL.md](MANUAL.md)
 
 | | ODM cameras | ODM-KJR |
 |---|---|---|
