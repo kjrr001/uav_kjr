@@ -39,7 +39,7 @@ run() { set +e; "$@" 2>&1 | grep -vE 'Warn|warn|census variant' >> "$LOG"; local
 
 CAM_ARGS=(); [ -n "${CAMERA:-}" ] && CAM_ARGS=(--camera "$(realpath "$CAMERA")")
 [ -f "$W/init/opensfm/reconstruction.json" ] || { say "init (EXIF${CAMERA:+, camera $CAMERA})"; run $PY "$K/exif_init.py" "$SRC" "$W/init" "${CAM_ARGS[@]}" ${EXIF_ARGS:-}; }
-# intrinsics: held at the given calibration, else self-calibrated (weakly determined, see MANUAL 4.1)
+# intrinsics: held at the given calibration, else self-calibrated (weakly determined, see MANUAL 4.2)
 if [ -n "${CAMERA:-}" ]; then INTR=(); else INTR=(--free-intr); say "no CAMERA given: self-calibration - check the result with CHECK=1"; fi
 [ -f "$W/ref/stereo_meta.json" ] || { say "pairs"; run $PY "$K/stereo.py" "$W/init" "$W/ref" --meta-only --prior-dsm none --min-overlap 0.05; }
 N=$($PY -c "import json; print(len(json.load(open('$W/ref/stereo_meta.json'))['pairs']))")

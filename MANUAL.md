@@ -1,6 +1,8 @@
 # ODM-KJR 매뉴얼
 
-ODM으로 처리한 드론 블록에서 DSM과 정사영상을 다시 만드는 도구다. ODM 결과의 카메라와 GCP 정합은 그대로 출발점으로 쓰고, 다음 세 단계를 자체 코드로 바꾼다.
+드론 사진과 GCP 목록으로 DSM과 정사영상을 만드는 도구다. **ODM은 필요 없다** (2026-10-27부터 기본 = `run.sh`).
+사진 위치·자세와 카메라 값(SfM)은 원본 OpenSfM(BSD)으로 구하고(§4.1), 다음 세 단계를 자체 코드로 한다.
+끝난 ODM 처리 폴더에서 시작하는 예전 방식(`run_block.sh`)도 그대로 쓸 수 있다. 라이선스는 `THIRD_PARTY_LICENSES.md`.
 
 1. **tie point**: 원본 JPEG에서 SIFT → MAGSAC++ → Gruen ALSC로 sub-pixel tie point를 뽑는다.
 2. **번들 조정(BBA)**: 자체 번들 조정에 사진 좌표 보정(반경 보정 + 2차원 격자 보정)을 더한다.
@@ -103,7 +105,8 @@ GCP 5개로 평면을 맞추면 과적합되므로(JJ-3 17.7 cm) 상수 이동�
 - UAV 정합 라이브러리 `UAV_LIB`: `tiepoints`(SIFT + MAGSAC++ + ALSC)와 `matcher`(census SGM). 현재 위치는 `/work10/planet_stereo/UAV`이다.
 - GDAL 명령행 도구: `gdal_translate`, `gdalwarp`, `gdaldem`
 - `g++` (OpenMP): 번들 조정의 C++ 커널 `kjr/csrc/schur.cpp`를 처음 실행할 때 `kjr/_schur.so`로 자동 컴파일한다. 직접 하려면 `cd kjr/csrc && g++ -O3 -march=native -fopenmp -shared -fPIC schur.cpp -o ../_schur.so`. 컴파일이 안 되면 scipy 방식으로 돌아간다 (3–4배 느림).
-- 끝난 ODM GCP 처리 폴더. 다음 파일이 있어야 한다:
+- 원본 OpenSfM (기본 처리 §4.1): `tools/build_opensfm.sh <폴더>`로 별도 conda 환경에 빌드한다. **ODM은 필요 없다.**
+- (ODM에서 시작하는 예전 방식만) 끝난 ODM GCP 처리 폴더. 다음 파일이 있어야 한다:
   - `opensfm/reconstruction.json`
   - `opensfm/undistorted/reconstruction.json` 및 `opensfm/undistorted/images/`
   - `odm_georeferencing/coords.txt`
@@ -122,11 +125,13 @@ export UAV_LIB=/path/to/UAV              # 기본 /work10/planet_stereo/UAV
 
 ## 4. 사용법
 
+기본은 §4.1 `run.sh`(ODM 불필요)이다. 끝난 ODM 처리 폴더가 있으면 거기서 시작할 수도 있다:
+
 ```bash
 ./run_block.sh <블록> <ODM 처리 폴더> <원본 사진 폴더> <GCP 목록> <작업 폴더> <제품 폴더>
 ```
 
-KJ-1 예:
+KJ-1 예 (ODM 시작):
 
 ```bash
 cd /work/eridu_drone/kjr/odm-kjr
@@ -149,7 +154,31 @@ REF_DSM=/work/eridu_drone/odm_backup/kjr_inputs/KJ1_gcp/odm_dem/dsm.tif ./run_bl
 **ODM 폴더와 원본 사진은 읽기만 한다.** 모든 결과는 작업 폴더와 제품 폴더에만 쓴다.
 (이 프로젝트의 ODM 중간 결과는 2026-10-27에 지웠다. KJR에 필요한 파일만 `/work/eridu_drone/odm_backup/kjr_inputs/<run>/`에 있다.)
 
-### 4.1 ODM 없이 처리 (`run_noodm.sh`)
+### 4.1 기본 처리: OpenSfM + KJR (`run.sh`, ODM 불필요)
+
+```bash
+tools/build_opensfm.sh /work/eridu_drone/kjr/opensfm      # 한 번만: 원본 OpenSfM을 수정 없이 빌드 (65571c8a)
+export OSFM_ENV=/work/eridu_drone/kjr/opensfm/env OSFM_SRC=/work/eridu_drone/kjr/opensfm/src
+./run.sh <블록> <원본 사진 폴더> <GCP 목록> <작업 폴더> <제품 폴더>
+```
+
+| 단계 | 하는 일 | 코드 |
+|---|---|---|
+| SfM | OpenSfM: SIFT, 매칭, 트랙, 증분 복원, GCP 포함 번들 조정. 설정은 ODM 3.5.6이 쓰던 값 (`tools/opensfm_config.yaml`, ODM 전용 dspsift 대신 SIFT). 카메라는 EXIF 초점거리에서 시작하는 brown 모델 | `tools/run_opensfm.sh` |
+| 변환 | OpenSfM 국지 좌표(ENU) → UTM. 점과 카메라 중심은 정확히 변환, 회전은 카메라마다 국지 상사변환. 사진 촬영 범위로 정사영상 격자, OpenSfM 점으로 참조 DSM (2 m) | `kjr/osfm_import.py` |
+| 나머지 | tie, BBA, 스테레오, 융합, 블렌드, 정사영상, 제품 (§2) | `run_block.sh` |
+
+- 결과: `<작업 폴더>/sfm/osfm` (OpenSfM 데이터셋), `<작업 폴더>/sfm/odm` (KJR 입력), 나머지는 `run_block.sh`와 같다.
+- `GSD=<m>`: 정사영상 해상도. 기본은 비행고도/초점거리.
+- JJ-3 검증 (2026-10-27):
+  - OpenSfM 11분, 117장 전부 복원. 초점거리 0.678 (ODM 0.666).
+  - 번들 조정 후 GCP 높이 오차가 ODM에서 시작했을 때와 4 cm 이내로 같다.
+  - GCP를 하나씩 빼는 검증 (블렌드 전): 102 cm, ODM 시작은 99 cm. 2.2 km 길이에 GCP 5점이라 둘 다 크다.
+  - 최종 DSM GCP RMS 5.3 cm (ODM 시작 전달본 9.9 cm). 전달본과의 차이 NMAD 14 cm, 수백 m 파장 (참조 DSM이 ODM 조밀 DSM 대신 OpenSfM 희소점).
+
+### 4.2 자체 SfM으로 처리 (`run_noodm.sh`) — 실패, 쓰지 말 것
+
+JJ-3에서 초점거리를 10 % 틀리게 추정해 블록 끝에서 수 m 오차가 났다. 기록으로만 남긴다. 대신 §4.1(`run.sh`)을 쓴다.
 
 ```bash
 ./run_noodm.sh <블록> <원본 사진 폴더> <GCP 목록> <작업 폴더> <제품 폴더>
@@ -277,14 +306,3 @@ $PY tools/gcp_check.py <gcp_list.txt> a.tif b.tif
 - KJ-1 최종 DSM 동쪽에 희미한 세로 띠가 하나 남아 있다. 사진 겹침 경계로 추정한다.
 - `tools/diag_consec.py`는 DJI 기본 파일명(`DJI_%04d.JPG`)을 가정한다.
 - 카메라는 블록당 하나(ODM 재구성의 첫 카메라)라고 가정한다.
-
-### 4.2 SfM with upstream OpenSfM instead of ODM (BSD-2, no AGPL code)
-`tools/run_opensfm.sh <images> <gcp list> <work>` runs mapillary/OpenSfM (built in
-/work/eridu_drone/kjr/opensfm/env, source in ../opensfm/src) with ODM 3.5.6's settings
-(`tools/opensfm_config.yaml`; SIFT instead of ODM's dspsift), brown camera from the EXIF focal,
-GCPs in the bundle, then `kjr/osfm_import.py` writes the run dir (`<work>/odm`, with a reference
-DSM from the OpenSfM points) for `run_block.sh` (REF_DSM=<work>/odm/odm_dem/dsm.tif).
-JJ-3 (2026-10-27): 117/117 images in 11 min; bba GCP residuals as from ODM (within 4 cm);
-LOO check points on the bba (before blend) 102 cm vs 99 cm from ODM (JJ-3 geometry, both);
-final DSM GCP RMS 5.3 cm (delivered 9.9 cm), DSM vs delivered NMAD 14 cm (long waves from the
-sparse reference DSM). Unlike run_noodm.sh (4.1) this is a usable replacement for ODM.

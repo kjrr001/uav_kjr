@@ -34,4 +34,4 @@ PY
 fi
 [ -f "$D/reconstruction.json" ] || for s in extract_metadata detect_features match_features create_tracks reconstruct; do osfm $s; done
 source "$HERE/env.sh"
-$PY "$HERE/kjr/osfm_import.py" "$D" "$W/odm"
+$PY "$HERE/kjr/osfm_import.py" "$D" "$W/odm" ${GSD:+--gsd $GSD}

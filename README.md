@@ -1,16 +1,22 @@
 # uav_kjr (ODM-KJR)
 
-Rebuilds the DSM and orthophoto of an ODM drone block without the in-DSM artefacts:
-concentric ripples (camera-model error fixed to image coordinates) and steps between
-image strips (pose error).
+DSM and orthophoto of a drone block from the raw images and a GCP list, without the in-DSM
+artefacts of ODM: concentric ripples (camera-model error fixed to image coordinates) and steps
+between image strips (pose error). **ODM is not needed** (licences: THIRD_PARTY_LICENSES.md).
 
-ODM solution → sub-pixel ties (SIFT, MAGSAC++, Gruen ALSC) → own bundle adjustment with
-radial + 2-D grid image correction → Lanczos undistortion → census-SGM per pair → robust
-fusion → long-wave blend with the ODM-camera DSM → orthophoto → COG / ENVI / JPG products.
+upstream OpenSfM (BSD) SfM with the GCPs → sub-pixel ties (SIFT, MAGSAC++, Gruen ALSC) → own
+bundle adjustment with radial + 2-D grid image correction → Lanczos undistortion → census-SGM
+per pair → robust fusion → long-wave blend with the SfM reference DSM → orthophoto →
+COG / ENVI / JPG products.
 
 ```bash
-./run_block.sh KJ1 <odm run> <image dir> <gcp_list.txt> <work dir> <products dir>
+tools/build_opensfm.sh /path/opensfm          # once; export OSFM_ENV=/path/opensfm/env OSFM_SRC=/path/opensfm/src
+./run.sh JJ3 <image dir> <gcp_list.txt> <work dir> <products dir>
 ```
+
+JJ-3 (117 images, 5 GCPs): OpenSfM 11 min, the BBA lands where it did from ODM (GCP residuals
+within 4 cm), final DSM GCP height RMS 5.3 cm (9.9 cm from ODM). Starting from a finished ODM
+run is still possible: `./run_block.sh <BLOCK> <odm run> <image dir> <gcp> <work> <products>`.
 
 Manual (Korean): [MANUAL.md](MANUAL.md)
 
@@ -30,11 +36,12 @@ threaded stereo and ortho. Details in MANUAL.md §2.1.
 Deliverables: `tools/export_products.sh` (DSM, ortho, small hillshade / ortho, image
 footprint map per block, context map on a regional DEM).
 
-## Without ODM (`run_noodm.sh`, experimental)
+## Own SfM (`run_noodm.sh`, failed — do not use)
 
 EXIF/XMP initial cameras, GCP similarity alignment, self-calibrating bundle adjustment and a
 tie-point reference DSM replace the ODM run. It processes a block end to end, but with nadir-only
 parallel strips and few GCPs the lens distortion and the block curvature are not separable:
 KJ-3 leave-one-out check points RMS 80 cm self-calibrated, 37 cm with the camera calibration of
 another block (`CAMERA=`), 21 cm starting from ODM. Give a camera calibration and check with
-`CHECK=1`; see MANUAL 4.1.
+`CHECK=1`; see MANUAL 4.2. On JJ-3 it failed outright (focal 10 % off, metre-level
+errors at the block ends); use `run.sh` (OpenSfM) instead.
