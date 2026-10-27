@@ -277,3 +277,14 @@ $PY tools/gcp_check.py <gcp_list.txt> a.tif b.tif
 - KJ-1 최종 DSM 동쪽에 희미한 세로 띠가 하나 남아 있다. 사진 겹침 경계로 추정한다.
 - `tools/diag_consec.py`는 DJI 기본 파일명(`DJI_%04d.JPG`)을 가정한다.
 - 카메라는 블록당 하나(ODM 재구성의 첫 카메라)라고 가정한다.
+
+### 4.2 SfM with upstream OpenSfM instead of ODM (BSD-2, no AGPL code)
+`tools/run_opensfm.sh <images> <gcp list> <work>` runs mapillary/OpenSfM (built in
+/work/eridu_drone/kjr/opensfm/env, source in ../opensfm/src) with ODM 3.5.6's settings
+(`tools/opensfm_config.yaml`; SIFT instead of ODM's dspsift), brown camera from the EXIF focal,
+GCPs in the bundle, then `kjr/osfm_import.py` writes the run dir (`<work>/odm`, with a reference
+DSM from the OpenSfM points) for `run_block.sh` (REF_DSM=<work>/odm/odm_dem/dsm.tif).
+JJ-3 (2026-10-27): 117/117 images in 11 min; bba GCP residuals as from ODM (within 4 cm);
+LOO check points on the bba (before blend) 102 cm vs 99 cm from ODM (JJ-3 geometry, both);
+final DSM GCP RMS 5.3 cm (delivered 9.9 cm), DSM vs delivered NMAD 14 cm (long waves from the
+sparse reference DSM). Unlike run_noodm.sh (4.1) this is a usable replacement for ODM.

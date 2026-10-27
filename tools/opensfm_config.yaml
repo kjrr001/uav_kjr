@@ -1,0 +1,24 @@
+# upstream OpenSfM settings for kjr (as ODM 3.5.6 sets them where upstream has the key); processes set by run_opensfm.sh
+use_exif_size: no
+feature_type: SIFT            # ODM used dspsift (ODM fork only)
+feature_process_size: 2048    # ODM feature_quality high = 0.5 x 4096
+feature_min_frames: 10000
+sift_peak_threshold: 0.066
+matcher_type: FLANN
+flann_algorithm: KDTREE
+matching_gps_neighbors: 0
+matching_gps_distance: 0
+matching_graph_rounds: 50
+optimize_camera_parameters: yes
+reconstruction_algorithm: incremental
+bundle_outlier_filtering_type: AUTO
+align_orientation_prior: vertical
+triangulation_type: ROBUST
+retriangulation_ratio: 2
+use_altitude_tag: yes
+align_method: auto
+bundle_interval: 100
+bundle_new_points_ratio: 1.2
+local_bundle_radius: 1
+bundle_use_gcp: yes
+bundle_compensate_gps_bias: yes
