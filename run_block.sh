@@ -1,101 +1,35 @@
 #!/usr/bin/env bash
-# ODM-KJR: one block, end to end, from a finished ODM GCP run (read only).
-#
-#   ref      stereo + fuse with the ODM cameras    -> work/ref   (pair list, long-wave reference DSM)
-#   ties     sub-pixel ties on the original JPEGs  -> work/ties  (SIFT -> MAGSAC++ -> ALSC, GPU)
-#   tracks   (opt-in, STAGES must name it) multi-view tracks: keypoints linked over the pairs,
-#            every view re-measured by ALSC from one reference  -> work/tracks.npz
-#            JJ-3: 42 % of points in 3+ views (8 % before) but the same DSM (GCP 9.9 -> 9.7 cm,
-#            west-edge stripes unchanged), +20 min
-#   bba      own bundle adjustment + radial/grid image correction -> work/bba (+ work/bba/odm)
-#   undist   Lanczos undistortion with the new camera            -> work/images
-#   stereo   census-SGM per pair on the new images, search centred on the ODM DSM -> work/stereo/pairs
-#   fuse     robust fusion of the pair rasters                    -> work/stereo/dsm_fused.tif
-#   blend    long waves (> sigma) from ref, detail from stereo    -> work/final/dsm_fused.tif
-#   ortho    orthophoto from the final DSM                        -> work/final/ortho.tif
-#   products COG / ENVI / JPG deliverables                        -> <products dir>
-#   diag     colour hillshade, GCP heights, ring test             -> work/diag
-#
+# Old command line, kept for compatibility: one block from a finished ODM GCP run (read only).
+# Writes a control file with SFM_SOURCE = the ODM run and runs kjr_run (use kjr_run).
 # Usage: run_block.sh <BLOCK> <odm run> <image dir> <gcp list> <work dir> <products dir>
-# Env:   STAGES="ties bba ..." run only these (default: all, in order)
-#        REF_DSM=<tif>  use this as the long-wave reference instead of making ref/dsm_fused.tif
-#                       (recommended: <odm run>/odm_dem/dsm.tif; JJ-1 GCP RMS 8.3 vs 13.6 cm, 45 min less)
-#        SHAPE_DSM=<tif>|self  long-wave shape for blend (default REF_DSM); self = keep the stereo DSM
-#        SIGMA=30 (blend, m)  BBA_ITERS=30  TIE_WORKERS=2  BBA_ARGS="--sig-gcp 0.03" (extra bba.py options)
-# Every stage skips when its output already exists: rerun after a failure resumes;
-# delete a stage's output to redo it.
+# Env:   STAGES="ties bba ..." -> START/END = first/last of them (ref ties tracks bba undist stereo
+#        fuse blend ortho products diag; naming tracks turns USE_TRACKS on)
+#        REF_DSM=<tif> (unset: reference DSM by stereo with the ODM cameras, as before), SHAPE_DSM,
+#        SIGMA, BBA_ITERS, TIE_WORKERS, BBA_ARGS; EXISTING (default skip), DRY_RUN=1
 set -euo pipefail
-[ $# -eq 6 ] || { sed -n 2,25p "$0"; exit 1; }
-B="$1"; ODM=$(realpath "$2"); SRC=$(realpath "$3"); GCP=$(realpath "$4"); W="$5"; OUT="$6"
-HERE=$(cd "$(dirname "$0")" && pwd)
-source "$HERE/env.sh"
-SIGMA=${SIGMA:-30}; BBA_ITERS=${BBA_ITERS:-30}; TIE_WORKERS=${TIE_WORKERS:-2}
-STAGES=${STAGES:-"ref ties bba undist stereo fuse blend ortho products diag"}   # + tracks (opt-in)
-mkdir -p "$W" "$OUT"; W=$(realpath "$W")
-LOG="$W/run_block.log"
-F='Warn|warn|census variant|exact streaming|FutureWarning|diags_array|warnings.warn|^Note: In Python'
-K="$HERE/kjr"; T="$HERE/tools"
-want() { [[ " $STAGES " == *" $1 "* ]]; }
-say() { echo "== $(date '+%F %T') $B $*" | tee -a "$LOG"; }
-run() {   # run a step, log its output without the noise, stop on failure
-  set +e; "$@" 2>&1 | grep -vE "$F" >> "$LOG"; local s=${PIPESTATUS[0]}; set -e
-  [ "$s" -eq 0 ] || { say "FAILED ($s): $*"; exit 1; }
-}
-
-for f in "$ODM/opensfm/reconstruction.json" "$ODM/opensfm/undistorted/reconstruction.json" \
-         "$ODM/odm_georeferencing/coords.txt" "$ODM/odm_orthophoto/odm_orthophoto.tif" "$GCP"; do
-  [ -e "$f" ] || { echo "missing: $f"; exit 1; }
-done
-say "start: odm $ODM, images $SRC, gcp $GCP, stages: $STAGES"
-REF=${REF_DSM:-$W/ref/dsm_fused.tif}
-case "${SHAPE_DSM:-}" in                     # long-wave shape for blend; "self": the stereo DSM itself
-  self) REF="$W/stereo/dsm_fused.tif" ;;    # (no long-wave change, GCP offset only)
-  "") ;;
-  *) REF="$SHAPE_DSM" ;;
-esac
-PRIOR=${REF_DSM:-$ODM/odm_dem/dsm.tif}     # centres the stereo search (+-8 px = only ~+-1 m of height)
-
-if want ref; then
-  if [ -n "${REF_DSM:-}" ]; then
-    [ -f "$W/ref/stereo_meta.json" ] || { say "ref: pair list only (REF_DSM given)"; run $PY "$K/stereo.py" "$ODM" "$W/ref" --meta-only --prior-dsm "$PRIOR"; }
-  elif [ ! -f "$W/ref/dsm_fused.tif" ]; then
-    say "ref stereo (ODM cameras)"; run $PY "$K/stereo.py" "$ODM" "$W/ref" --prior-dsm "$PRIOR"
-    say "ref fuse";                 run $PY "$K/fuse.py" "$W/ref"
-  fi
-fi
-if want ties; then
-  N=$($PY -c "import json; print(len(json.load(open('$W/ref/stereo_meta.json'))['pairs']))")
-  if [ "$(ls "$W/ties" 2>/dev/null | grep -c npz)" -lt "$N" ]; then
-    say "ties ($N pairs)"; run $PY "$K/ties.py" "$W/ref/stereo_meta.json" "$SRC" "$W" --workers "$TIE_WORKERS" --keep-sift
-  fi
-fi
-if want tracks && [ ! -f "$W/tracks.npz" ]; then
-  say "tracks"; run $PY "$K/tracks.py" "$W/ref/stereo_meta.json" "$SRC" "$W"
-fi
-rm -rf "$W/sift"                              # SIFT cache (~80 MB per image), only ties/tracks use it
-TRK=(); [ -f "$W/tracks.npz" ] && TRK=(--tracks "$W/tracks.npz")
-if want bba && [ ! -f "$W/bba/bba.json" ]; then
-  say "bba ($BBA_ITERS iterations)"; run $PY "$K/bba.py" "$ODM" "$W/ties" "$GCP" "$W/bba" --iters "$BBA_ITERS" "${TRK[@]}" ${BBA_ARGS:-}
-  grep -E "^it |GCP . triangulated|grid correction" "$W/bba/bba.log" | tail -8 | tee -a "$LOG"
-fi
-if want undist; then
-  NAMES=$(ls "$SRC" | grep -i '\.jpg$' | sed 's/$/.tif/')
-  say "undistort"; run $PY "$K/undistort.py" "$W/bba/odm" "$SRC" "$W/images" $NAMES
-fi
-if want stereo; then say "stereo"; run $PY "$K/stereo.py" "$W/bba/odm" "$W/stereo" --img-dir "$W/images" --prior-dsm "$PRIOR"; fi
-if want fuse && [ ! -f "$W/stereo/dsm_fused.tif" ]; then say "fuse"; run $PY "$K/fuse.py" "$W/stereo"; fi
-if want blend && [ ! -f "$W/final/dsm_fused.tif" ]; then
-  mkdir -p "$W/final"
-  say "blend (sigma $SIGMA m, reference $REF)"; run $PY "$K/lowblend.py" "$W/stereo/dsm_fused.tif" "$REF" "$W/final/dsm_fused.tif" --sigma "$SIGMA" --gcp "$GCP"
-fi
-if want ortho && [ ! -f "$W/final/ortho.tif" ]; then
-  say "ortho"; run $PY "$K/ortho.py" "$W/bba/odm" "$W/final" --img-dir "$W/images"
-fi
-if want products; then say "products -> $OUT"; run "$K/make_products.sh" "$B" "$W/final" "$OUT"; fi
-if want diag; then
-  mkdir -p "$W/diag"; say "diag"
-  run $PY "$T/color_hillshade.py" "$W/final/dsm_fused.tif" "$OUT/${B}_kjr_dsm_color_hillshade_small.jpg"
-  $PY "$T/gcp_check.py" "$GCP" "$REF" "$W/stereo/dsm_fused.tif" "$W/final/dsm_fused.tif" 2>&1 | grep -vE "$F" | tee -a "$LOG"
-  $PY "$T/diag_imgfixed.py" "$W/final/dsm_fused.tif" "$W/bba/odm" "$W/diag/imgfixed.npy" 2>&1 | grep "hp DSM" | tee -a "$LOG"
-fi
-say "done"
+[ $# -eq 6 ] || { sed -n 2,9p "$0"; exit 1; }
+HERE=$(cd "$(dirname "$0")" && pwd); W=$(realpath -m "$5"); mkdir -p "$W/job"
+declare -A M=([ref]=PAIRS [ties]=TIEPOINT [tracks]=TRACKS [bba]=BBA [undist]=UNDISTORT [stereo]=DSM_EXTRACTION
+              [fuse]=FUSE [blend]=BLEND [ortho]=ORTHO [products]=PRODUCTS [diag]=DIAG)
+ST=(${STAGES:-ref diag}); TRK=no
+for s in "${ST[@]}"; do [ -n "${M[$s]:-}" ] || { echo "unknown stage $s"; exit 1; }; [ "$s" = tracks ] && TRK=yes; done
+C="$W/job/run_block.cfg"
+cat > "$C" <<CFG
+BLOCK        : $1
+SFM_SOURCE   : $(realpath "$2")
+INPUT_DIR    : $(realpath "$3")
+GCP_FILE     : $(realpath "$4")
+WORK_DIR     : $W
+OUTPUT_DIR   : $(realpath -m "$6")
+EXISTING     : ${EXISTING:-skip}
+START        : ${M[${ST[0]}]}
+END          : ${M[${ST[-1]}]}
+USE_TRACKS   : $TRK
+REF_DSM      : ${REF_DSM:-stereo}
+SHAPE_DSM    : ${SHAPE_DSM:-ref}
+BLEND_SIGMA  : ${SIGMA:-30}
+BBA_ITERS    : ${BBA_ITERS:-30}
+TIE_WORKERS  : ${TIE_WORKERS:-2}
+BBA_OPTIONS  : ${BBA_ARGS:-}
+CFG
+exec "$HERE/kjr_run" "$C" ${DRY_RUN:+--dry-run}

@@ -1,8 +1,8 @@
 # ODM-KJR 매뉴얼
 
-드론 사진과 GCP 목록으로 DSM과 정사영상을 만드는 도구다. **ODM은 필요 없다** (2026-10-27부터 기본 = `run.sh`).
+드론 사진과 GCP 목록으로 DSM과 정사영상을 만드는 도구다. **ODM은 필요 없다.** 실행은 컨트롤 파일(`*.cfg`)과 `kjr_run`으로 한다 (§4).
 사진 위치·자세와 카메라 값(SfM)은 원본 OpenSfM(BSD)으로 구하고(§4.1), 다음 세 단계를 자체 코드로 한다.
-끝난 ODM 처리 폴더에서 시작하는 예전 방식(`run_block.sh`)도 그대로 쓸 수 있다. 라이선스는 `THIRD_PARTY_LICENSES.md`.
+끝난 ODM 처리 폴더에서 시작하는 예전 방식도 `SFM_SOURCE`로 쓸 수 있다. 라이선스는 `THIRD_PARTY_LICENSES.md`.
 
 1. **tie point**: 원본 JPEG에서 SIFT → MAGSAC++ → Gruen ALSC로 sub-pixel tie point를 뽑는다.
 2. **번들 조정(BBA)**: 자체 번들 조정에 사진 좌표 보정(반경 보정 + 2차원 격자 보정)을 더한다.
@@ -31,20 +31,33 @@
 
 ## 2. 처리 단계
 
-`run_block.sh` 하나가 아래 단계를 순서대로 실행한다. 단계마다 결과가 이미 있으면 건너뛴다. 그래서 중간에 실패해도 다시 실행하면 이어서 진행한다.
+`kjr_run`이 아래 단계를 순서대로 실행한다 (`kjr_run --stages`). 번호 1–4는 OpenSfM SfM (§4.1), 5–15는 아래 표, 16 `EXPORT`는 전달 폴더(§5.1).
+컨트롤 파일의 `START`, `END`로 범위를 정하고, `EXISTING`으로 이미 있는 결과를 어떻게 할지 정한다 (§4.3).
+
+| 번호 | 단계 | 하는 일 |
+|---|---|---|
+| 1 | `SFM_FEATURE` | OpenSfM: EXIF, 카메라 모델(EXIF 초점거리에서 시작하는 brown), SIFT 특징점 |
+| 2 | `SFM_MATCH` | OpenSfM: 매칭, 트랙 |
+| 3 | `SFM_RECON` | OpenSfM: 증분 복원, GCP 포함 번들 조정 |
+| 4 | `GEOREF` | ENU → UTM, 정사영상 격자, SfM 점으로 참조 DSM (`osfm_import.py`) |
+| 5–15 | `PAIRS` … `DIAG` | 아래 표 |
+| 16 | `EXPORT` | 전달 폴더 (`EXPORT_DIR` 필요, 기본 범위 밖) |
+
+SfM을 세 단계로 나눈 이유: 특징점 추출은 설정과 무관하게 재사용할 수 있고, 매칭·트랙은 매칭 설정에만, 복원은 GCP·카메라 설정에만 따른다.
+GCP나 카메라 설정만 바꾸면 `START : SFM_RECON`으로 복원만 다시 한다 (JJ-3: 특징점 1분, 매칭 2분, 복원 8분).
 
 | 단계 | 하는 일 | 결과 (`<work>/`) | KJ-3 소요 (RTX 4060 8 GB, 16코어), 최적화 전 → 후 |
 |---|---|---|---|
-| `ref` | ODM 카메라로 stereo + 융합 → 사진 쌍 목록, 긴 파장 참조 DSM. `REF_DSM`을 주면 사진 쌍 목록만 | `ref/stereo_meta.json`, `ref/dsm_fused.tif` | 약 45분 → 약 15분 (`REF_DSM`이면 수 초) |
-| `ties` | 원본 JPEG에서 tie point 추출: 사진별 SIFT 1회 → GPU 유도 정합 → MAGSAC++ → GPU ALSC | `ties/<a>__<b>.npz` | 39분 → **8분** (215쌍) |
-| `bba` | 번들 조정 (LM, 점 소거 Schur는 C++/OpenMP 커널, Cauchy 가중) | `bba/bba.json`, `bba/bba.log`, `bba/odm/` | 22분 → **5분** |
-| `undist` | 새 카메라로 Lanczos 왜곡 보정 | `images/*.JPG.tif` | 1분 |
-| `stereo` | 사진 쌍별 census-SGM (fsgbm, MGM, CUDA). 탐색 중심은 ODM DSM. CPU 작업은 스레드로 GPU 정합과 겹친다. 서브픽셀 커널과 SGM 실행 루프는 자체 구현(`kjr/fastmatch.py`) | `stereo/pairs/*.npz` | 21분 → 12분 → **6.7분** |
-| `fuse` | 강건 융합 (중앙값 + NMAD, 가장자리·외곽 가중). 셀별 통계는 GPU. 사진 쌍이 1–2개뿐인 셀은 스파이크 기준 12 cm + 평활 쪽으로 혼합 (`lown_smooth`, 끄기 `--no-lown`) | `stereo/dsm_fused.tif` | 17분 → **1분** |
-| `blend` | 긴 파장(σ 30 m)은 `ref`, 세부는 `stereo`. GCP 대비 평균 높이 편차가 유의하면(> 표준오차 2배) 상수 하나만큼 옮김 | `final/dsm_fused.tif` | 수 초 |
-| `ortho` | 최종 DSM으로 정사영상 (가장 수직에 가까운 사진에 가중), 타일 병렬 | `final/ortho.tif` | 4분 → **2분** |
-| `products` | COG, ENVI, JPG 제품 파일 | `<products>/` | 약 2.5분 (디스크 쓰기) |
-| `diag` | 컬러 힐쉐이드, GCP 높이, 사진 좌표 무늬 검사 | `diag/`, 로그 | 수십 초 |
+| 5 `PAIRS` | 사진 쌍 목록. `REF_DSM : stereo`이면 SfM 카메라로 stereo + 융합해 긴 파장 참조 DSM도 만든다 | `ref/stereo_meta.json`, `ref/dsm_fused.tif` | `REF_DSM : stereo`일 때 약 45분 → 약 15분, 기본은 수 초 |
+| 6 `TIEPOINT` | 원본 JPEG에서 tie point 추출: 사진별 SIFT 1회 → GPU 유도 정합 → MAGSAC++ → GPU ALSC | `ties/<a>__<b>.npz` | 39분 → **8분** (215쌍) |
+| 8 `BBA` | 번들 조정 (LM, 점 소거 Schur는 C++/OpenMP 커널, Cauchy 가중) | `bba/bba.json`, `bba/bba.log`, `bba/odm/` | 22분 → **5분** |
+| 9 `UNDISTORT` | 새 카메라로 Lanczos 왜곡 보정 | `images/*.JPG.tif` | 1분 |
+| 10 `DSM_EXTRACTION` | 사진 쌍별 census-SGM (fsgbm, MGM, CUDA). 탐색 중심은 ODM DSM. CPU 작업은 스레드로 GPU 정합과 겹친다. 서브픽셀 커널과 SGM 실행 루프는 자체 구현(`kjr/fastmatch.py`) | `stereo/pairs/*.npz` | 21분 → 12분 → **6.7분** |
+| 11 `FUSE` | 강건 융합 (중앙값 + NMAD, 가장자리·외곽 가중). 셀별 통계는 GPU. 사진 쌍이 1–2개뿐인 셀은 스파이크 기준 12 cm + 평활 쪽으로 혼합 (`lown_smooth`, 끄기 `--no-lown`) | `stereo/dsm_fused.tif` | 17분 → **1분** |
+| 12 `BLEND` | 긴 파장(σ 30 m)은 참조 DSM, 세부는 stereo. GCP 대비 평균 높이 편차가 유의하면(> 표준오차 2배) 상수 하나만큼 옮김 | `final/dsm_fused.tif` | 수 초 |
+| 13 `ORTHO` | 최종 DSM으로 정사영상 (가장 수직에 가까운 사진에 가중), 타일 병렬 | `final/ortho.tif` | 4분 → **2분** |
+| 14 `PRODUCTS` | COG, ENVI, JPG 제품 파일 | `<products>/` | 약 2.5분 (디스크 쓰기) |
+| 15 `DIAG` | 컬러 힐쉐이드, GCP 높이, 사진 좌표 무늬 검사 | `diag/`, 로그 | 수십 초 |
 
 블록 하나(`REF_DSM` 사용)에 KJ-3 기준 **약 1시간 47분 → 32분 → 약 27분** 걸린다. 결과 품질은 같다 (KJ-3 GCP 높이 RMS 7.1 → 7.1 cm, 사진 좌표 무늬 0.51 cm / 상관 0.27 → 같음). JJ-3처럼 사진 쌍이 많은 블록(961쌍)은 stereo가 가장 길다 (약 45분 → 약 25분 예상).
 디스크는 작업 폴더에 약 10 GB(+ tie 단계 동안 SIFT 캐시 사진당 약 80 MB, 끝나면 지움), 제품 파일에 약 11 GB가 든다.
@@ -76,7 +89,7 @@ JJ-1 결과(첫 판): 쌍 1개 셀의 고주파 노이즈 p95가 5.4 → 1.5 cm,
 
 ### 2.3 다중 사진 tie 트랙 (선택, 2026-10-27)
 
-`tracks` 단계(`kjr/tracks.py`, `STAGES`에 넣어야 실행)는 사진 쌍마다 저장한 SIFT 특징점 번호로 같은 점을 여러 사진에 걸쳐 묶는다. 트랙마다 사진 중심에 가장 가까운 관측을 기준으로 정하고, 나머지 관측은 모두 그 기준에서 ALSC로 다시 잰다.
+7 `TRACKS` 단계(`kjr/tracks.py`, `USE_TRACKS : yes`일 때만 실행)는 사진 쌍마다 저장한 SIFT 특징점 번호로 같은 점을 여러 사진에 걸쳐 묶는다. 트랙마다 사진 중심에 가장 가까운 관측을 기준으로 정하고, 나머지 관측은 모두 그 기준에서 ALSC로 다시 잰다.
 JJ-3에서 3장 이상 보이는 점이 8 → 42 %로 늘었지만 결과 DSM은 거의 같았다 (GCP 9.9 → 9.7 cm, 사진 좌표 무늬 0.42 → 0.43 cm). 서쪽 가장자리의 가로 물결도 그대로라서, 원인은 번들 조정의 블록 강성이 아니다. KJ-3도 같았다 (stereo GCP 10.5 → 10.2 cm). 시간은 약 10–20분 더 들기 때문에 기본으로는 쓰지 않는다.
 
 ### 2.4 GCP 높이 기준 (2026-10-27)
@@ -125,60 +138,121 @@ export UAV_LIB=/path/to/UAV              # 기본 /work10/planet_stereo/UAV
 
 ## 4. 사용법
 
-기본은 §4.1 `run.sh`(ODM 불필요)이다. 끝난 ODM 처리 폴더가 있으면 거기서 시작할 수도 있다:
-
-```bash
-./run_block.sh <블록> <ODM 처리 폴더> <원본 사진 폴더> <GCP 목록> <작업 폴더> <제품 폴더>
-```
-
-KJ-1 예 (ODM 시작):
+블록마다 컨트롤 파일(`*.cfg`, 텍스트) 하나를 쓰고 `kjr_run`으로 실행한다.
 
 ```bash
 cd /work/eridu_drone/kjr/odm-kjr
-./run_block.sh KJ1 \
-    /work/eridu_drone/odm_backup/kjr_inputs/KJ1_gcp \
-    /work/eridu_drone/KJ-1 \
-    /work/eridu_drone/final_output_kj1/gcp_list_final.txt \
-    /work/eridu_drone/kjr/runs/KJ1 \
-    /work/eridu_drone/kjr/products/KJ1
+./kjr_run cfg/eridu/JJ3.cfg                       # 블록 하나
+./kjr_run cfg/eridu/*.cfg                         # 여러 블록을 차례로 (하나가 실패해도 다음 블록 진행)
+./kjr_run cfg/eridu/JJ3.cfg --start BBA --end DIAG --existing archive   # 범위·처리 방식을 명령에서 덮어쓰기
+./kjr_run cfg/eridu/JJ3.cfg --dry-run             # 검사만: 실행할 단계와 명령을 보여 주고 아무것도 안 함
+./kjr_run --stages                                # 단계 목록
+./kjr_run --keys                                  # 컨트롤 파일 항목과 기본값
 ```
 
-권장 실행 (ODM DSM을 참조로):
+오래 걸리므로 `nohup ./kjr_run ... > run.out 2>&1 &`로 띄우고 `<WORK_DIR>/kjr_run.log`를 본다.
+**원본 사진과 `SFM_SOURCE`의 ODM 폴더는 읽기만 한다.** 결과는 `WORK_DIR`, `OUTPUT_DIR`, `EXPORT_DIR`에만 쓴다.
 
-```bash
-REF_DSM=/work/eridu_drone/odm_backup/kjr_inputs/KJ1_gcp/odm_dem/dsm.tif ./run_block.sh KJ1 ...
+### 4.1 컨트롤 파일
+
+```
+# JJ3.cfg   '#' 뒤는 주석. 형식 "항목 : 값". 항목 이름은 대소문자 구분 없음
+TITLE        : Eridu JJ-3
+BLOCK        : JJ3
+INCLUDE      : ../common.cfg                     # 공통 설정 (환경 경로 등)
+INPUT_DIR    : /work/eridu_drone/JJ-3           # 원본 사진 *.jpg
+GCP_FILE     : /work/eridu_drone/final_output_jj3/gcp_list_v2.txt
+WORK_DIR     : /work/eridu_drone/kjr/runs_osfm/${BLOCK}
+OUTPUT_DIR   : /work/eridu_drone/kjr/products_osfm/${BLOCK}
+START        : SFM_FEATURE                       # 단계 이름 또는 번호
+END          : DIAG
+EXISTING     : skip                              # skip | archive | delete
 ```
 
-오래 걸리므로 `nohup ... &`로 띄우고 `<작업 폴더>/run_block.log`를 본다.
+- 상대경로는 그 컨트롤 파일이 있는 폴더 기준이다. `${BLOCK}`처럼 다른 항목 값을 쓸 수 있다.
+- `INCLUDE`한 파일의 값은 기본값 역할이다. 같은 항목이 있으면 **포함하는 파일이 이긴다** (줄 위치와 무관).
+- 모르는 항목(오타)은 오류로 멈춘다 (`unknown key STRAT (did you mean START?)`). 필수 항목이 없거나, 파일·폴더가 없거나, `END`가 `START`보다 앞이어도 실행 전에 멈춘다.
+- 예: `cfg/example.cfg`, `cfg/common.cfg`, 이 현장 6개 블록 `cfg/eridu/*.cfg`.
 
-**ODM 폴더와 원본 사진은 읽기만 한다.** 모든 결과는 작업 폴더와 제품 폴더에만 쓴다.
-(이 프로젝트의 ODM 중간 결과는 2026-10-27에 지웠다. KJR에 필요한 파일만 `/work/eridu_drone/odm_backup/kjr_inputs/<run>/`에 있다.)
+| 항목 | 기본값 | 의미 |
+|---|---|---|
+| `BLOCK`, `INPUT_DIR`, `GCP_FILE`, `WORK_DIR`, `OUTPUT_DIR` | (필수) | 블록 이름, 사진 폴더, GCP 목록(OpenSfM/ODM 형식), 작업 폴더, 제품 폴더 |
+| `TITLE` | | 로그에 쓰는 설명 |
+| `START`, `END` | 첫 단계, `DIAG` | 실행 범위 (이름 또는 번호, §2) |
+| `EXISTING` | `skip` | §4.3 |
+| `SFM_SOURCE` | `opensfm` | `opensfm` = 1–4단계 실행. 끝난 ODM 폴더를 주면 그 결과에서 시작 (1–4단계 없음, 예전 방식) |
+| `OSFM_CONFIG` | `tools/opensfm_config.yaml` | OpenSfM 설정 |
+| `OSFM_PROCESSES` | `auto` (CPU − 2) | OpenSfM 프로세스 수 |
+| `CAMERA_OVERRIDES` | `auto` | `auto` = 카메라마다 EXIF 초점거리에서 시작하는 brown. 아니면 OpenSfM `camera_models_overrides.json` 파일 |
+| `GSD` | `auto` | 정사영상 해상도 (m). `auto` = 비행고도 / 초점거리 |
+| `REF_CELL` | 2 | SfM 점으로 만드는 참조 DSM 격자 (m) |
+| `REF_DSM` | `auto` | 긴 파장 참조 DSM이자 stereo 탐색 중심. `auto` = SfM DSM (`opensfm`: OpenSfM 점, ODM: ODM DSM). `stereo` = `PAIRS`에서 SfM 카메라 stereo로 만듦 (느림, JJ-1 GCP RMS 13.6 cm 대 `auto` 8.3 cm). 또는 tif 파일 |
+| `SHAPE_DSM` | `ref` | `BLEND`의 긴 파장 기준. `ref` = `REF_DSM`, `self` = 긴 파장 보정 안 함 (GCP 오프셋만), 또는 tif |
+| `BLEND_SIGMA` | 30 | `BLEND`의 Gaussian σ (m) |
+| `BBA_ITERS` | 30 | 번들 조정 반복 횟수 |
+| `BBA_OPTIONS` | | `bba.py` 추가 옵션. 예: `--sig-gcp 0.03` |
+| `TIE_WORKERS` | 2 | tie point 병렬 작업 수 (GPU 공유, 메모리가 모자라면 자동 재시도) |
+| `USE_TRACKS` | `no` | `yes` = 7 `TRACKS` 실행, BBA에 사용 (§2.3) |
+| `PRODUCT_NAME` | `${BLOCK}_kjr` | 제품 파일 이름 앞부분: `<이름>_dsm.tif`, `<이름>_ortho.tif`, … |
+| `EXPORT_DIR`, `REGIONAL_DEM` | | `EXPORT` 단계 (§5.1) |
+| `KJR_ENV`, `UAV_LIB` | `env.sh` 기본 | KJR 파이썬 환경, UAV 정합 라이브러리 |
+| `OSFM_ENV`, `OSFM_SRC` | `/work/eridu_drone/kjr/opensfm/{env,src}` | OpenSfM 환경과 소스 (`tools/build_opensfm.sh`) |
 
-### 4.1 기본 처리: OpenSfM + KJR (`run.sh`, ODM 불필요)
+### 4.2 SfM: 원본 OpenSfM (1–4단계)
 
 ```bash
 tools/build_opensfm.sh /work/eridu_drone/kjr/opensfm      # 한 번만: 원본 OpenSfM을 수정 없이 빌드 (65571c8a)
-export OSFM_ENV=/work/eridu_drone/kjr/opensfm/env OSFM_SRC=/work/eridu_drone/kjr/opensfm/src
-./run.sh <블록> <원본 사진 폴더> <GCP 목록> <작업 폴더> <제품 폴더>
 ```
 
 | 단계 | 하는 일 | 코드 |
 |---|---|---|
-| SfM | OpenSfM: SIFT, 매칭, 트랙, 증분 복원, GCP 포함 번들 조정. 설정은 ODM 3.5.6이 쓰던 값 (`tools/opensfm_config.yaml`, ODM 전용 dspsift 대신 SIFT). 카메라는 EXIF 초점거리에서 시작하는 brown 모델 | `tools/run_opensfm.sh` |
-| 변환 | OpenSfM 국지 좌표(ENU) → UTM. 점과 카메라 중심은 정확히 변환, 회전은 카메라마다 국지 상사변환. 사진 촬영 범위로 정사영상 격자, OpenSfM 점으로 참조 DSM (2 m) | `kjr/osfm_import.py` |
-| 나머지 | tie, BBA, 스테레오, 융합, 블렌드, 정사영상, 제품 (§2) | `run_block.sh` |
+| 1–3 | OpenSfM: SIFT, 매칭, 트랙, 증분 복원, GCP 포함 번들 조정. 설정은 ODM 3.5.6이 쓰던 값 (`tools/opensfm_config.yaml`, ODM 전용 dspsift 대신 SIFT) | `kjr/jobctl.py` → `opensfm_main.py` |
+| 4 `GEOREF` | OpenSfM 국지 좌표(ENU) → UTM. 점과 카메라 중심은 정확히 변환, 회전은 카메라마다 국지 상사변환. 사진 촬영 범위로 정사영상 격자, OpenSfM 점으로 참조 DSM | `kjr/osfm_import.py` |
 
-- 결과: `<작업 폴더>/sfm/osfm` (OpenSfM 데이터셋), `<작업 폴더>/sfm/odm` (KJR 입력), 나머지는 `run_block.sh`와 같다.
-- `GSD=<m>`: 정사영상 해상도. 기본은 비행고도/초점거리.
+- 결과: `<WORK_DIR>/sfm/osfm` (OpenSfM 데이터셋), `<WORK_DIR>/sfm/odm` (5단계 이후의 입력).
 - JJ-3 검증 (2026-10-27):
   - OpenSfM 11분, 117장 전부 복원. 초점거리 0.678 (ODM 0.666).
   - 번들 조정 후 GCP 높이 오차가 ODM에서 시작했을 때와 4 cm 이내로 같다.
   - GCP를 하나씩 빼는 검증 (블렌드 전): 102 cm, ODM 시작은 99 cm. 2.2 km 길이에 GCP 5점이라 둘 다 크다.
   - 최종 DSM GCP RMS 5.3 cm (ODM 시작 전달본 9.9 cm). 전달본과의 차이 NMAD 14 cm, 수백 m 파장 (참조 DSM이 ODM 조밀 DSM 대신 OpenSfM 희소점).
 
-### 4.2 자체 SfM으로 처리 (`run_noodm.sh`) — 실패, 쓰지 말 것
+### 4.3 범위와 기존 결과 (`START`, `END`, `EXISTING`)
 
-JJ-3에서 초점거리를 10 % 틀리게 추정해 블록 끝에서 수 m 오차가 났다. 기록으로만 남긴다. 대신 §4.1(`run.sh`)을 쓴다.
+- `START` 앞의 단계는 결과가 있어야 한다. 없으면 "`BBA (before START) has no results … Set START to BBA or earlier`"로 멈춘다.
+- `START`–`END` 안의 단계는 `EXISTING`에 따라:
+
+| `EXISTING` | 결과가 이미 있는 단계 |
+|---|---|
+| `skip` (기본) | 끝난 단계는 건너뛴다. 덜 끝난 단계(`TIEPOINT`, `UNDISTORT`, `DSM_EXTRACTION`)는 남은 것만 이어서 한다 |
+| `archive` | 다시 실행한다. 옛 결과는 먼저 `<WORK_DIR>/old/<시각>/`으로 옮긴다 (같은 디스크 안 이동이라 빠르지만 용량은 그대로 차지) |
+| `delete` | 다시 실행한다. 옛 결과는 먼저 지운다 |
+
+- **낡은 결과 (stale)**: 어떤 단계를 실행하면 그 뒤 단계 결과는 모두 낡은 것으로 표시된다 (`<WORK_DIR>/job/stale`). 낡은 단계는
+  - `skip`이어도 건너뛰지 않는다 (지우고 다시 실행: 이어서 하는 단계가 옛 사진·옛 쌍을 그대로 쓰는 것을 막는다).
+  - `START` 앞에 있으면 멈춘다. 예: `BBA`만 다시 돌린 뒤 `START : DSM_EXTRACTION`이면 "`UNDISTORT … is stale`".
+  - `END` 뒤에 남으면 끝에 "results of later stages are now stale"로 알려 준다.
+- 예:
+  - 섞는 σ만 바꾸기: `BLEND_SIGMA : 50`, `START : BLEND`, `END : DIAG`, `EXISTING : archive`.
+  - GCP 수정 후: `START : SFM_RECON` (특징점·매칭 재사용).
+  - 실패 후 이어서: 같은 파일을 `EXISTING : skip`으로 다시 실행.
+
+### 4.4 기록
+
+실행할 때마다 `<WORK_DIR>/job/<시각>/`에 남긴다:
+- `control.cfg` (원본 복사), `resolved.cfg` (기본값까지 채운 모든 값), `git.txt` (커밋, 수정 사항)
+- `code/`: 실행한 코드 사본. 모든 단계는 이 사본으로 실행되므로 **실행 중에 저장소를 고쳐도 돌고 있는 작업은 바뀌지 않는다.**
+
+그 밖에 `<WORK_DIR>/kjr_run.log` (단계별 시작·끝·소요 시간·요약), `<WORK_DIR>/job/logs/<번호>_<단계>.log` (단계 전체 출력), `<WORK_DIR>/job/done/` (끝난 단계 표시).
+
+### 4.5 예전 명령 (호환용)
+
+`run.sh <블록> <사진> <GCP> <작업> <제품>`과 `run_block.sh <블록> <ODM 폴더> <사진> <GCP> <작업> <제품>`은 컨트롤 파일을 `<작업>/job/`에 만들어 `kjr_run`을 부른다.
+환경변수 `STAGES`(처음–끝 단계를 범위로), `REF_DSM`(`run_block.sh`에서 없으면 `stereo`, 예전 기본과 같음), `SHAPE_DSM`, `SIGMA`, `BBA_ITERS`, `TIE_WORKERS`, `BBA_ARGS`, `GSD`, `EXISTING`, `DRY_RUN=1`을 받는다.
+전달본(2026-10-26)은 `backup/delivered_20261026/rerun_delivered.sh`로 다시 만든다 (그때 코드 그대로).
+
+### 4.6 자체 SfM으로 처리 (`run_noodm.sh`) — 실패, 쓰지 말 것
+
+JJ-3에서 초점거리를 10 % 틀리게 추정해 블록 끝에서 수 m 오차가 났다. 기록으로만 남긴다. 대신 `kjr_run`(§4)을 쓴다.
 
 ```bash
 ./run_noodm.sh <블록> <원본 사진 폴더> <GCP 목록> <작업 폴더> <제품 폴더>
@@ -216,23 +290,6 @@ GCP에 큰 가중치를 주면 GCP 자체는 잘 맞지만 (KJ-3 GCP RMS 6.1 cm)
 - 이 블록들처럼 연직만 찍은 자료는 **ODM 해에서 시작하는 `run_block.sh`가 여전히 가장 정확하다.**
 - `run_noodm.sh`는 ODM 없이 끝까지 처리할 수 있게 해 준다. 하지만 **카메라 보정값(`CAMERA=`)을 주거나**, 교차·경사 비행선이나 GCP가 많은 블록에서 써야 한다. 결과는 반드시 `CHECK=1`(GCP leave-one-out 검사점)로 확인한다.
 
-### 환경변수 옵션
-
-| 변수 | 기본값 | 의미 |
-|---|---|---|
-| `STAGES` | 전체 | 실행할 단계만 지정. 예: `STAGES="blend ortho products"` |
-| `REF_DSM` | (없음) | 긴 파장 참조 DSM을 직접 지정한다. **권장값: ODM 자체 DSM (`<ODM 처리 폴더>/odm_dem/dsm.tif`).** 그러면 `ref` 단계는 사진 쌍 목록만 만들고 약 45분을 아낀다. JJ-1에서 GCP 높이 RMS는 ODM 카메라로 만든 참조를 쓸 때 13.6 cm, ODM DSM을 쓸 때 8.3 cm였고, 무늬 제거 효과는 같았다 (0.46/0.18 → 0.47/0.19). |
-| `SIGMA` | 30 | `blend`의 Gaussian σ (m) |
-| `BBA_ITERS` | 30 | 번들 조정 반복 횟수 |
-| `TIE_WORKERS` | 2 | tie point 사진 쌍 병렬 작업 수(GPU 공유). GPU 메모리가 모자라면 자동으로 재시도한다. |
-
-### 다시 돌리기
-
-- 단계마다 결과 파일이 있으면 건너뛴다. 그 단계를 다시 하려면 결과를 지운다.
-  - 예: 번들 조정부터 다시 → `bba/`, `images/`, `stereo/`, `final/`을 지운다.
-  - 예: 섞는 σ만 바꾸기 → `final/`을 지우고 `STAGES="blend ortho products diag" SIGMA=50 ./run_block.sh ...`
-- `undist`와 `stereo`는 파일 단위로 이어서 진행한다. 카메라가 바뀌었다면 `images/`와 `stereo/`를 반드시 지운다.
-
 ---
 
 ## 5. 결과물
@@ -251,6 +308,9 @@ GCP에 큰 가중치를 주면 GCP 자체는 잘 맞지만 (KJ-3 GCP RMS 6.1 cm)
 `<작업 폴더>/final/dsm_fused.tif`는 DSM 원본 격자(정사영상 픽셀의 2배, KJ-1은 13 cm)이다.
 
 ### 5.1 전달용 폴더 만들기
+
+컨트롤 파일에 `EXPORT_DIR`(와 `REGIONAL_DEM`)을 넣고 `START : EXPORT`, `END : EXPORT`로 실행한다. 블록마다 `EXPORT_DIR/<BLOCK>/`을 만들고, `uav_context_map.png`는 그때까지 `EXPORT_DIR`에 있는 모든 블록으로 다시 그린다.
+여러 블록을 한 번에 하는 예전 스크립트:
 
 ```bash
 tools/export_products.sh <products 루트> <작업 루트> <전달 폴더> <지역 DEM.tif> JJ1 JJ2 JJ3 KJ1 KJ2 KJ3

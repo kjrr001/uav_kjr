@@ -10,13 +10,23 @@ per pair → robust fusion → long-wave blend with the SfM reference DSM → or
 COG / ENVI / JPG products.
 
 ```bash
-tools/build_opensfm.sh /path/opensfm          # once; export OSFM_ENV=/path/opensfm/env OSFM_SRC=/path/opensfm/src
-./run.sh JJ3 <image dir> <gcp_list.txt> <work dir> <products dir>
+tools/build_opensfm.sh /path/opensfm          # once (upstream OpenSfM, unmodified)
+./kjr_run cfg/example.cfg                     # one block from a control file
+./kjr_run cfg/eridu/*.cfg                     # several blocks, one after the other
+./kjr_run JJ3.cfg --start BBA --end DIAG --existing archive   # stage range / old results
+./kjr_run --stages ; ./kjr_run --keys ; ./kjr_run JJ3.cfg --dry-run
 ```
 
+Control file (`*.cfg`, "KEY : value"): `BLOCK`, `INPUT_DIR`, `GCP_FILE`, `WORK_DIR`, `OUTPUT_DIR`,
+`START`/`END` (16 stages: SFM_FEATURE SFM_MATCH SFM_RECON GEOREF PAIRS TIEPOINT TRACKS BBA
+UNDISTORT DSM_EXTRACTION FUSE BLEND ORTHO PRODUCTS DIAG EXPORT), `EXISTING : skip | archive |
+delete`, options; `INCLUDE` for shared settings. Each run records the control file, all
+resolved values, the git state and a copy of the code it ran in `<WORK_DIR>/job/`.
+`SFM_SOURCE : <finished ODM run>` starts from ODM results instead of OpenSfM.
+`run.sh` / `run_block.sh` remain as wrappers for the old command lines.
+
 JJ-3 (117 images, 5 GCPs): OpenSfM 11 min, the BBA lands where it did from ODM (GCP residuals
-within 4 cm), final DSM GCP height RMS 5.3 cm (9.9 cm from ODM). Starting from a finished ODM
-run is still possible: `./run_block.sh <BLOCK> <odm run> <image dir> <gcp> <work> <products>`.
+within 4 cm), final DSM GCP height RMS 5.3 cm (9.9 cm from ODM).
 
 Manual (Korean): [MANUAL.md](MANUAL.md)
 
@@ -44,4 +54,4 @@ parallel strips and few GCPs the lens distortion and the block curvature are not
 KJ-3 leave-one-out check points RMS 80 cm self-calibrated, 37 cm with the camera calibration of
 another block (`CAMERA=`), 21 cm starting from ODM. Give a camera calibration and check with
 `CHECK=1`; see MANUAL 4.2. On JJ-3 it failed outright (focal 10 % off, metre-level
-errors at the block ends); use `run.sh` (OpenSfM) instead.
+errors at the block ends); use `kjr_run` (OpenSfM) instead.

@@ -2,8 +2,8 @@
 """Per block: small ortho with the UAV block boundary (red) and the ground footprint of
 every camera image (BBA poses, image border rays intersected with the DSM, lens distortion
 ignored), labelled with the image number at the camera position.
-Usage: image_footprints.py <BLOCK> <work dir> <products dir> <out.png> <small ortho.jpg>
-  (products dir holds <BLOCK>_kjr_dsm.tif and <BLOCK>_kjr_ortho.tif)"""
+Usage: image_footprints.py <name> <work dir> <products dir> <out.png> <small ortho.jpg>
+  (products dir holds <name>_dsm.tif and <name>_ortho.tif; name = product prefix, e.g. KJ1_kjr)"""
 import json, sys
 import numpy as np
 from osgeo import gdal
@@ -19,7 +19,7 @@ rec = json.load(open(f"{run}/bba/odm/opensfm/reconstruction.json"))[0]
 cam = next(iter(rec["cameras"].values())); w, h = cam["width"], cam["height"]; S = max(w, h)
 f = cam["focal_x"] if "focal_x" in cam else cam["focal"]
 off = np.array(list(map(float, open(f"{run}/bba/odm/odm_georeferencing/coords.txt").read().split("\n")[1].split()[:2])))
-dsm = gdal.Open(f"{prod}/{B}_kjr_dsm.tif")
+dsm = gdal.Open(f"{prod}/{B}_dsm.tif")
 d2 = gdal.Translate("", dsm, format="MEM", xRes=1, yRes=1, resampleAlg="average")
 gt = d2.GetGeoTransform(); Z = d2.ReadAsArray().astype(float); Z[~np.isfinite(Z) | (Z < -1000)] = np.nan
 zmed = np.nanmedian(Z); Zf = np.where(np.isfinite(Z), Z, zmed)
@@ -44,11 +44,11 @@ for name, sh in sorted(rec["shots"].items()):
     fps[name] = (X[:, :2] + off, C[:2] + off)
 
 # small ortho + its extent
-o = gdal.Open(f"{prod}/{B}_kjr_ortho.tif"); og = o.GetGeoTransform()
+o = gdal.Open(f"{prod}/{B}_ortho.tif"); og = o.GetGeoTransform()
 import PIL.Image as Image
 small = Image.open(small_jpg)
 ext = [og[0], og[0] + og[1] * o.RasterXSize, og[3] + og[5] * o.RasterYSize, og[3]]
-q = footprint(f"{prod}/{B}_kjr_dsm.tif")         # UTM, the DSM's CRS
+q = footprint(f"{prod}/{B}_dsm.tif")         # UTM, the DSM's CRS
 
 allp = np.vstack([p for p, _ in fps.values()])
 pad = 15
@@ -69,6 +69,6 @@ ax.plot(q[:, 0], q[:, 1], color="red", lw=2.5)
 ax.set_xlim(xl); ax.set_ylim(yl); ax.set_aspect("equal")
 ax.ticklabel_format(useOffset=False, style="plain")
 ax.set_xlabel("UTM 38N Easting (m)"); ax.set_ylabel("UTM 38N Northing (m)")
-ax.set_title(f"{B}: ODM-KJR ortho, UAV DSM/ortho boundary (red), {len(fps)} camera image footprints (BBA poses on DSM)", fontsize=11)
+ax.set_title(f"{B}: ortho, UAV DSM/ortho boundary (red), {len(fps)} camera image footprints (BBA poses on DSM)", fontsize=11)
 ax.grid(alpha=0.3)
 fig.savefig(outpng, dpi=130, bbox_inches="tight"); print("written", outpng, len(fps))

@@ -5,11 +5,11 @@
 #   <B>_kjr_{ortho,dsm}_envi.tif  uncompressed striped BigTIFF Float32 NaN (ENVI)
 #   <B>_kjr_ortho.jpg, _ortho_85pct.jpg, _dsm_hillshade.jpg (+ .wld/.aux.xml)
 # No DTM: the site has no vegetation, DSM = DTM.
-# Usage: make_products.sh <BLOCK e.g. KJ1> <dir with ortho.tif, dsm_fused.tif> <out dir>
+# Usage: make_products.sh <BLOCK e.g. KJ1> <dir with ortho.tif, dsm_fused.tif> <out dir> [<name prefix>, default <BLOCK>_kjr]
 set -euo pipefail
 B="$1"; SRC="$2"; OUT="$3"
 PYG="${PY:-python3}"   # any python with GDAL bindings
-P="${B}_kjr"
+P="${4:-${B}_kjr}"
 mkdir -p "$OUT"
 TMP=$(mktemp -d -p "$OUT" .tmp.XXXX)
 trap 'rm -rf "$TMP"' EXIT

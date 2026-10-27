@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ODM-KJR without ODM: import an upstream OpenSfM (mapillary/OpenSfM, BSD) reconstruction.
 
-OpenSfM is run on the images and the GCP list by the user (tools/run_opensfm.sh); it leaves
+OpenSfM is run on the images and the GCP list (kjr_run stages 1-3, kjr/jobctl.py); it leaves
 reconstruction.json in a topocentric (ENU) frame about reference_lla. This writes the
 ODM-like run dir every kjr step reads (as exif_init.py does):
   opensfm/reconstruction.json             brown camera, shots, points in UTM - offset

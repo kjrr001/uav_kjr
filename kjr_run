@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# uav_kjr main entry: run blocks from control files (*.cfg). See cfg/example.cfg, MANUAL §4.
+#   kjr_run JJ3.cfg [KJ1.cfg ...] [--start BBA] [--end DIAG] [--existing skip|archive|delete] [--dry-run]
+#   kjr_run --stages | --keys
+# The driver needs only the python3 standard library; each stage uses KJR_ENV / OSFM_ENV.
+exec "${KJR_PYTHON:-python3}" "$(cd "$(dirname "$0")" && pwd)/kjr/jobctl.py" "$@"
